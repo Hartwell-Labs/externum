@@ -1,6 +1,0 @@
-[default.extend-words]
-pn = "pn"
-
-[default.extend-identifiers]
-pn = "pn"
-BA = "BA"
