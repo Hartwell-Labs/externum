@@ -1,19 +1,19 @@
-<img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=6,11,20&height=130&section=header&text=externum&fontSize=32&animation=fadeIn" width="100%" />
-
 <div align="center">
 
-[![Typing SVG](https://readme-typing-svg.demolab.com/?font=JetBrains+Mono&weight=600&size=18&duration=3000&pause=1200&color=58A6FF&center=true&vCenter=true&width=600&height=45&lines=Programming%20language%20%E2%80%94%20compiles%20to%20Python%2C%20Bash%2C%20binary.%20379%20tests%2C%20browser%20REPL%2C%20DRM%2C%20ownership%2Btraits%20)](https://github.com/BartoszOsiej/externum)
+<img src="https://raw.githubusercontent.com/Hartwell-Labs/.github/main/profile/assets/hartwell-logo.svg" width="72" alt="Hartwell Labs" />
 
-</div># ⚡ Externum
+## externum
 
-[![Launch week on DevHunt](https://img.shields.io/badge/DevHunt-Launch%20Week%2022%E2%80%9329%20Sep-8A2BE2)](https://devhunt.org/tool/externum)
+A typed language compiling to readable Python, Bash and native EXBC bytecode — self-hosted, 400+ tests, browser REPL.
 
-![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python)
-![PyPI](https://img.shields.io/pypi/v/externum?style=flat-square&logo=pypi&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-382%20✓-brightgreen?style=flat-square)
-![Docker](https://img.shields.io/badge/Docker-GHCR-2496ED?style=flat-square&logo=docker)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](https://github.com/BartoszOsiej/externum/blob/main/LICENSE)
+[![Python](https://img.shields.io/badge/Python%20·%20Bash%20·%20bytecode-compiler-F15A24?style=flat-square&logo=python)](.) [![PyPI](https://img.shields.io/pypi/v/externum?style=flat-square&logo=pypi&logoColor=white)](https://pypi.org/project/externum/)
+[![License](https://img.shields.io/badge/license-MIT-F15A24?style=flat-square)](LICENSE) [![Website](https://img.shields.io/badge/site-hartwell--labs.github.io-4f46e5?style=flat-square)](https://hartwell-labs.github.io)
+
+[Website](https://hartwell-labs.github.io) · [All products](https://hartwell-labs.github.io/products/) · [Security](https://hartwell-labs.github.io/security/) · [Hack the Lab](https://github.com/Hartwell-Labs/hack-the-lab)
+
+</div>
+
+# ⚡ Externum
 
 **A self-hosted programming language blending Python readability, binary performance,
 and Bash system control. The compiler is written in Externum itself — bootstrap with a minimal Python runtime.**
@@ -353,9 +353,22 @@ bootstraps from a 6.4 KB Python stub; everything else is written in Externum.
 
 ## License
 
-MIT
+MIT — part of the [Hartwell Labs](https://hartwell-labs.github.io) toolset.
+
 ## Deep Dives
 
 Extended dossiers (architecture, verification, benchmarks, error codex) ship in this repo:
 - [docs/ERROR_CODEX.md](docs/ERROR_CODEX.md)
 - [SECURITY.md](SECURITY.md)
+
+---
+
+<div align="center">
+
+**[Hartwell Labs](https://github.com/Hartwell-Labs)** — security systems, languages and tools, built in the open.
+
+[Website](https://hartwell-labs.github.io) · [All products](https://hartwell-labs.github.io/products/) · [Security policy](https://hartwell-labs.github.io/security/) · [Report a vulnerability](https://hartwell-labs.github.io/security/)
+
+<sub>MIT License · © 2026 Hartwell Labs</sub>
+
+</div>

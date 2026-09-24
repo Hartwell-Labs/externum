@@ -1,3 +1,18 @@
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/Hartwell-Labs/.github/main/profile/assets/hartwell-logo.svg" width="72" alt="Hartwell Labs" />
+
+## externum
+
+Typowany język kompilujący się do czytelnego Pythona, Basha i natywnego bytecode'u EXBC — self-hosted, 400+ testów, REPL w przeglądarce.
+
+[![Hartwell Labs](https://img.shields.io/badge/%E2%AC%A1-Hartwell_Labs-F15A24?style=flat-square)](https://hartwell-labs.github.io)
+[![License](https://img.shields.io/badge/license-MIT-F15A24?style=flat-square)](LICENSE) [![Website](https://img.shields.io/badge/site-hartwell--labs.github.io-4f46e5?style=flat-square)](https://hartwell-labs.github.io)
+
+[Strona](https://hartwell-labs.github.io) · [Wszystkie produkty](https://hartwell-labs.github.io/products/) · [Polityka bezpieczeństwa](https://hartwell-labs.github.io/security/) · [🇬🇧 English](README.md)
+
+</div>
+
 # Externum
 
 **Externum v3.0** — pełny język programowania będący mieszanką czytelności
@@ -154,3 +169,13 @@ docs/WIKI.md          # Specyfikacja języka
 
 Moduły zarezerwowane w API (`externum.llm`, `neural`, `distributed`,
 `types`, `spec`, `debug`) pozostają w planie — pakiet działa bez nich.
+
+---
+
+<div align="center">
+
+**[Hartwell Labs](https://github.com/Hartwell-Labs)** — systemy bezpieczeństwa, języki i narzędzia, budowane jawnie.
+
+<sub>Licencja MIT · © 2026 Hartwell Labs</sub>
+
+</div>
