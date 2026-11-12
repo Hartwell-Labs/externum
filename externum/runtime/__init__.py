@@ -17,7 +17,17 @@ from ..analysis import check_or_raise, preprocess
 from ..compiler import Compiler
 from ..lexer import Lexer
 from ..parser import Parser
-from .rtlib import externum_globals, _MAX_FREED, _MAX_HEAP_SLOTS, _MAX_THREADS, _freed_ids
+from .rtlib import _MAX_FREED, _MAX_HEAP_SLOTS, _MAX_THREADS, _freed_ids, externum_globals
+
+# Re-exported on purpose: the executor limits are part of the runtime's
+# testable surface (`from externum.runtime import _MAX_HEAP_SLOTS, ...`).
+__all__ = [
+    "Runtime",
+    "_MAX_FREED",
+    "_MAX_HEAP_SLOTS",
+    "_MAX_THREADS",
+    "_freed_ids",
+]
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
