@@ -83,12 +83,14 @@ class TestVMClassInFunction(unittest.TestCase):
         self.assertIn("7", out.getvalue())
 
 
-class TestVMComprehensionMessage(unittest.TestCase):
-    def test_clear_error_for_comprehension_on_vm(self):
+class TestVMComprehensions(unittest.TestCase):
+    def test_list_comprehension_runs_on_vm(self):
+        # v4.4: the bytecode VM compiles comprehensions instead of raising.
         src = "xs: List[Int] = [1, 2]\nprint([x for x in xs])\n"
-        with self.assertRaises(SyntaxError) as cm:
-            VM().run_source(src)
-        self.assertIn("does not support comprehensions", str(cm.exception))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            VM(stdout=out).run_source(src)
+        self.assertIn("[1, 2]", out.getvalue())
 
 
 if __name__ == "__main__":

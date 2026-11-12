@@ -17,6 +17,7 @@ Executes compiled BytecodeModule objects.  Supports:
   - Structs and enums (algebraic data types)
 """
 
+import builtins as _builtins
 import itertools as _itertools
 import queue
 import sys
@@ -34,8 +35,14 @@ from .bytecode import (
     BITOR,
     BITXOR,
     CALL,
+    CALL_EX,
     DBG_OP,
     DEFER_PUSH,
+    DEL_ATTR,
+    DEL_INDEX,
+    DEL_NAME,
+    DICT_SET,
+    DICT_UPDATE,
     DIV,
     DUP,
     ENUM_IS,
@@ -53,11 +60,15 @@ from .bytecode import (
     IMPORT,
     IN_OP,
     INTRINSIC,
+    INTRINSIC_EX,
     IS_OP,
     JUMP,
     JUMP_IF,
     JUMP_IF_NOT,
     JUMP_IF_POP,
+    LIST_APPEND,
+    LIST_EXTEND,
+    LIST_TO_TUPLE,
     LOAD_CONST,
     LOAD_DEREF,
     LOAD_GLOBAL,
@@ -93,6 +104,7 @@ from .bytecode import (
     RESULT_OK,
     RETURN,
     RSHIFT,
+    SET_ADD,
     SET_ATTR,
     SET_INDEX,
     SLICE,
@@ -159,6 +171,26 @@ class ExternumEnum(ExternumObject):
     def data(self):
         return object.__getattribute__(self, "__data")
 
+    def __call__(self, data=None):
+        """Variants are both values and constructors: `Color.RED` / `Some(x)`."""
+        return ExternumEnum(
+            object.__getattribute__(self, "__typename"),
+            object.__getattribute__(self, "__variant"),
+            data,
+        )
+
+    def __eq__(self, other):
+        if not isinstance(other, ExternumEnum):
+            return NotImplemented
+        return (
+            object.__getattribute__(self, "__typename") == object.__getattribute__(other, "__typename")
+            and object.__getattribute__(self, "__variant") == object.__getattribute__(other, "__variant")
+            and object.__getattribute__(self, "__data") == object.__getattribute__(other, "__data")
+        )
+
+    def __hash__(self):
+        return hash((object.__getattribute__(self, "__typename"), object.__getattribute__(self, "__variant")))
+
     def __repr__(self):
         tn = object.__getattribute__(self, "__typename")
         v = object.__getattribute__(self, "__variant")
@@ -223,11 +255,19 @@ class ExternumOption(ExternumObject):
 class ExternumClosure(ExternumObject):
     """A closure wrapping a function with captured upvalues."""
 
-    __slots__ = ("_fn", "_upvalues")
+    __slots__ = ("_fn", "_upvalues", "_vm")
 
-    def __init__(self, fn: BytecodeFunction, upvalues: dict):
+    def __init__(self, fn: BytecodeFunction, upvalues: dict, vm=None):
         object.__setattr__(self, "_fn", fn)
         object.__setattr__(self, "_upvalues", upvalues)
+        object.__setattr__(self, "_vm", vm)
+
+    def __call__(self, *args, **kwargs):
+        """Let host code (sorted/min/max `key=`) call an Externum lambda."""
+        vm = object.__getattribute__(self, "_vm")
+        if vm is None:
+            raise ExternumError("closure is not attached to a VM")
+        return vm._call_value(self, list(args), kwargs)
 
     @property
     def fn(self):
@@ -260,10 +300,42 @@ class ExternumClass:
     def __init__(self, name: str, methods: dict, bases: list = None):
         self.name = name
         self.methods = methods
-        self.bases = bases or []
+        self.bases = list(bases or [])
+
+    def lookup(self, name: str):
+        """Depth-first method resolution across the base classes."""
+        if name in self.methods:
+            return self.methods[name]
+        for base in self.bases:
+            if isinstance(base, ExternumClass):
+                found = base.lookup(name)
+                if found is not None:
+                    return found
+        return None
 
     def __repr__(self):
         return f"<class {self.name}>"
+
+
+class ExternumSuper(ExternumObject):
+    """`super()` proxy: resolves attributes on the base classes of an instance."""
+
+    def __init__(self, instance):
+        object.__setattr__(self, "_instance", instance)
+
+    def __getattr__(self, name):
+        inst = object.__getattribute__(self, "_instance")
+        if inst is None:
+            raise AttributeError("super() used outside a method")
+        cls = object.__getattribute__(inst, "_cls")
+        for base in getattr(cls, "bases", []):
+            if isinstance(base, ExternumClass):
+                found = base.lookup(name)
+                if found is not None:
+                    if isinstance(found, ExternumClosure):
+                        return ExternumBoundMethod(inst, found)
+                    return found
+        raise AttributeError(f"super object has no attribute '{name}'")
 
 
 class ExternumInstance:
@@ -280,9 +352,9 @@ class ExternumInstance:
         if name in a:
             return a[name]
         cls = object.__getattribute__(self, "_cls")
-        if hasattr(cls, "methods") and name in cls.methods:
-            method = cls.methods[name]
-            if hasattr(method, "__get__"):
+        method = cls.lookup(name) if hasattr(cls, "lookup") else None
+        if method is not None:
+            if hasattr(method, "__get__") and not isinstance(method, ExternumClosure):
                 return method.__get__(self, type(self))
             if isinstance(method, ExternumClosure):
                 return ExternumBoundMethod(self, method)
@@ -391,6 +463,8 @@ class VM:
         self._modules: dict[str, BytecodeModule] = {}
         self._defer_stack: list[list] = []
         self._channels: dict[int, queue.Queue] = {}
+        # Instance currently executing a bound method (for `super()`).
+        self._instance_stack: list[Any] = []
         # Error context: last (module, function, ip) seen by the interpreter,
         # used to map exceptions back to source lines for diagnostics.
         self._current_module: BytecodeModule | None = None
@@ -401,6 +475,40 @@ class VM:
         self._thread_counter = _itertools.count(1)
         self._builtin_keys = set()  # track builtins for import filtering
         # Pre-populate builtins
+        # Exception types are first-class values in the VM (raise/catch).
+        for _exc_name in (
+            "Exception",
+            "BaseException",
+            "ValueError",
+            "TypeError",
+            "KeyError",
+            "IndexError",
+            "AttributeError",
+            "NameError",
+            "RuntimeError",
+            "ZeroDivisionError",
+            "AssertionError",
+            "StopIteration",
+            "NotImplementedError",
+            "OSError",
+            "IOError",
+            "OverflowError",
+        ):
+            self._globals[_exc_name] = getattr(_builtins, _exc_name)
+        # Type names are values in the VM too (`alloc(Int)`, annotations).
+        for _tname, _tval in (
+            ("Int", int),
+            ("Float", float),
+            ("Str", str),
+            ("Bool", bool),
+            ("Any", object),
+            ("Void", type(None)),
+            ("List", list),
+            ("Dict", dict),
+            ("Ptr", int),
+            ("Optional", object),
+        ):
+            self._globals[_tname] = _tval
         self._globals["print"] = self._builtin_print
         self._globals["input"] = self._builtin_input
         self._globals["len"] = self._builtin_len
@@ -519,7 +627,11 @@ class VM:
         self._modules[module.name] = module
         self._current_module = module
         self._current_fn = None
-        result = self._execute(module.bytecode, module.constants, {}, module.functions)
+        self._defer_stack.append([])
+        try:
+            result = self._execute(module.bytecode, module.constants, {}, module.functions)
+        finally:
+            self._run_deferred(self._defer_stack.pop())
         # v4.3 entrypoint: a module that defines main() but never calls it
         # (no top-level reference) would exit silently after definition-only
         # execution. Match the python backend: define everything, then call
@@ -539,6 +651,7 @@ class VM:
         kwargs: dict = None,
         upvalues: dict = None,
         fn_obj: "BytecodeFunction | None" = None,
+        yield_sink: list = None,
     ) -> Any:
         # Save and restore the stack to avoid corruption during nested calls
         saved_stack = self._stack
@@ -546,6 +659,7 @@ class VM:
         saved_fn = self._current_fn
         saved_ip = self._current_ip
         self._call_stack.append((saved_fn, saved_ip))
+        self._defer_stack.append([])
         try:
             # Build local vars: named args first, then defaults
             local_vars = dict(upvalues or {})
@@ -563,17 +677,28 @@ class VM:
                 self._modules[list(self._modules.keys())[0]].functions if self._modules else [],
                 fn_name=fn.name,
                 fn_obj=fn_obj or fn,
+                yield_sink=yield_sink,
             )
         finally:
+            self._run_deferred(self._defer_stack.pop())
             self._stack = saved_stack
             self._current_fn, self._current_ip = self._call_stack.pop()
 
+    def _run_deferred(self, deferred: list) -> None:
+        for fn in reversed(deferred or []):
+            try:
+                self.run_function(fn, [])
+            except Exception:
+                pass
+
     def run_source(self, source: str) -> Any:
-        """Compile source and run it."""
+        """Compile source and run it (macros expanded, `comptime` stripped)."""
+        from .analysis import preprocess
         from .bytecode import BytecodeCompiler
         from .lexer import Lexer
         from .parser import Parser
 
+        source, _macros = preprocess(source)
         tokens = Lexer(source).tokenize()
         ast = list(Parser(tokens).parse())
         compiler = BytecodeCompiler(ast)
@@ -614,6 +739,58 @@ class VM:
         except ImportError:
             raise ExternumError(f"Cannot import {name!r}")
 
+    def _call_value(self, fn, args, kwargs=None):
+        """Invoke any callable VM value with positional and keyword args."""
+        kwargs = kwargs or {}
+        if isinstance(fn, ExternumBoundMethod):
+            self._instance_stack.append(fn.instance)
+            try:
+                return self.run_function(
+                    fn.closure.fn,
+                    [fn.instance] + list(args),
+                    kwargs=kwargs,
+                    upvalues=fn.closure.upvalues,
+                )
+            finally:
+                self._instance_stack.pop()
+        if isinstance(fn, ExternumClosure):
+            if getattr(fn.fn, "is_generator", False):
+                sink: list = []
+                self.run_function(fn.fn, list(args), kwargs=kwargs, upvalues=fn.upvalues, yield_sink=sink)
+                return iter(sink)
+            return self.run_function(fn.fn, list(args), kwargs=kwargs, upvalues=fn.upvalues)
+        if isinstance(fn, BytecodeFunction):
+            if getattr(fn, "is_generator", False):
+                sink = []
+                self.run_function(fn, list(args), kwargs=kwargs, fn_obj=fn, yield_sink=sink)
+                return iter(sink)
+            return self.run_function(fn, list(args), kwargs=kwargs, fn_obj=fn)
+        if isinstance(fn, ExternumClass):
+            instance = ExternumInstance(fn)
+            init_fn = fn.lookup("__init__")
+            if init_fn is not None:
+                self._instance_stack.append(instance)
+                try:
+                    if isinstance(init_fn, ExternumClosure):
+                        self.run_function(
+                            init_fn.fn,
+                            [instance] + list(args),
+                            kwargs=kwargs,
+                            upvalues=init_fn.upvalues,
+                        )
+                    elif isinstance(init_fn, BytecodeFunction):
+                        self.run_function(init_fn, [instance] + list(args), kwargs=kwargs)
+                    elif callable(init_fn):
+                        init_fn(instance, *args, **kwargs)
+                finally:
+                    self._instance_stack.pop()
+            return instance
+        if isinstance(fn, ExternumStruct):
+            return fn
+        if callable(fn):
+            return fn(*args, **kwargs)
+        raise ExternumError(f"cannot call {fn!r}")
+
     # ── bytecode executor ─────────────────────────────────────────
     def _execute(
         self,
@@ -623,6 +800,7 @@ class VM:
         all_fns: list,
         fn_name: str = "<module>",
         fn_obj: "BytecodeFunction | None" = None,
+        yield_sink: list = None,
     ) -> Any:
         ip = 0
         stack = self._stack
@@ -663,6 +841,9 @@ class VM:
                         return stack.pop()
                     return None
                 elif op == YIELD_VAL:
+                    if yield_sink is not None:
+                        yield_sink.append(stack.pop() if stack else None)
+                        continue
                     return _GeneratorSentinel
 
                 # ── load/store ──
@@ -817,46 +998,28 @@ class VM:
                     for _ in range(argc):
                         args.insert(0, stack.pop())
                     fn = stack.pop()
-                    if isinstance(fn, ExternumBoundMethod):
-                        stack.append(
-                            self.run_function(fn.closure.fn, [fn.instance] + args, upvalues=fn.closure.upvalues)
-                        )
-                    elif callable(fn):
-                        stack.append(fn(*args))
-                    elif isinstance(fn, ExternumClosure):
-                        stack.append(self.run_function(fn.fn, args, upvalues=fn.upvalues))
-                    elif isinstance(fn, BytecodeFunction):
-                        stack.append(self.run_function(fn, args, fn_obj=fn))
-                    elif isinstance(fn, ExternumClass):
-                        instance = ExternumInstance(fn)
-                        if "__init__" in fn.methods:
-                            init_fn = fn.methods["__init__"]
-                            if isinstance(init_fn, ExternumClosure):
-                                self.run_function(init_fn.fn, [instance] + args, upvalues=init_fn.upvalues)
-                            elif isinstance(init_fn, BytecodeFunction):
-                                self.run_function(init_fn, [instance] + args)
-                        stack.append(instance)
-                    elif isinstance(fn, ExternumStruct):
-                        # Struct instantiation
-                        typename = object.__getattribute__(fn, "__typename") if hasattr(fn, "__typename") else "Struct"
-                        fields = object.__getattribute__(fn, "__fields") if hasattr(fn, "__fields") else {}
-                        stack.append(fn)
-                    elif isinstance(fn, ExternumResult) or isinstance(fn, ExternumOption):
-                        stack.append(fn)
-                    else:
-                        raise ExternumError(f"cannot call {fn!r}")
+                    stack.append(self._call_value(fn, args))
+
+                elif op == CALL_EX:
+                    # fn, args-list, kwargs-dict (star/kwargs aware call)
+                    kwargs = dict(stack.pop() or {})
+                    args = list(stack.pop() or [])
+                    fn = stack.pop()
+                    stack.append(self._call_value(fn, args, kwargs))
 
                 elif op == MAKE_FN:
                     idx = _read_u16()
                     fn = all_fns[idx]
-                    closure = ExternumClosure(fn, dict(locals_))
+                    closure = ExternumClosure(fn, dict(locals_), self)
                     stack.append(closure)
                     self._fns_by_name[fn.name] = fn  # diagnostics: line lookup
 
                 elif op == MAKE_CLASS:
                     idx = _read_u16()
+                    base_count = _read_u8()
                     name = constants[idx]
-                    stack.append(ExternumClass(name, {}))
+                    bases = [stack.pop() for _ in range(base_count)][::-1]
+                    stack.append(ExternumClass(name, {}, bases))
 
                 # ── containers ──
                 elif op == MAKE_LIST:
@@ -884,6 +1047,34 @@ class VM:
                     for _ in range(count):
                         items.add(stack.pop())
                     stack.append(items)
+                elif op == LIST_APPEND:
+                    value = stack.pop()
+                    container = stack.pop()
+                    container.append(value)
+                    stack.append(container)
+                elif op == LIST_EXTEND:
+                    iterable = stack.pop()
+                    container = stack.pop()
+                    container.extend(iterable)
+                    stack.append(container)
+                elif op == SET_ADD:
+                    value = stack.pop()
+                    container = stack.pop()
+                    container.add(value)
+                    stack.append(container)
+                elif op == DICT_SET:
+                    value = stack.pop()
+                    key = stack.pop()
+                    container = stack.pop()
+                    container[key] = value
+                    stack.append(container)
+                elif op == DICT_UPDATE:
+                    mapping = stack.pop()
+                    container = stack.pop()
+                    container.update(mapping)
+                    stack.append(container)
+                elif op == LIST_TO_TUPLE:
+                    stack.append(tuple(stack.pop()))
                 elif op == UNPACK:
                     count = _read_u16()
                     val = stack.pop()
@@ -895,8 +1086,20 @@ class VM:
                     idx = _read_u16()
                     name = constants[idx]
                     obj = stack.pop()
-                    if isinstance(obj, ExternumStruct) or isinstance(obj, ExternumEnum):
+                    if isinstance(obj, ExternumStruct):
                         stack.append(obj.__getattr__(name))
+                    elif isinstance(obj, ExternumEnum):
+                        stack.append(getattr(obj, name))
+                    elif isinstance(obj, ExternumClass):
+                        # `Pokemon.__init__` must resolve to the Externum method,
+                        # not Python's own ExternumClass.__init__.
+                        found = obj.lookup(name)
+                        if found is not None:
+                            stack.append(found)
+                        elif name == "__name__":
+                            stack.append(obj.name)
+                        else:
+                            stack.append(getattr(obj, name))
                     elif isinstance(obj, dict):
                         stack.append(obj[name])
                     else:
@@ -936,15 +1139,38 @@ class VM:
                         obj = stack.pop()
                         stack.append(obj[start:stop])
                 elif op == SET_INDEX:
-                    idx = stack.pop()
+                    # compiler pushes (obj, index, value)
                     val = stack.pop()
+                    idx = stack.pop()
                     obj = stack.pop()
                     obj[idx] = val
+                elif op == DEL_INDEX:
+                    idx = stack.pop()
+                    obj = stack.pop()
+                    del obj[idx]
+                elif op == DEL_ATTR:
+                    name = constants[_read_u16()]
+                    obj = stack.pop()
+                    if isinstance(obj, ExternumInstance):
+                        obj.attrs.pop(name, None)
+                    elif isinstance(obj, dict):
+                        obj.pop(name, None)
+                    else:
+                        delattr(obj, name)
+                elif op == DEL_NAME:
+                    name = constants[_read_u16()]
+                    if name in locals_:
+                        del locals_[name]
+                    else:
+                        self._globals.pop(name, None)
 
                 # ── loops ──
                 elif op == FOR_ITER:
                     target = _read_u16()
                     iterator = stack[-1]
+                    if not hasattr(iterator, "__next__"):
+                        iterator = iter(iterator)
+                        stack[-1] = iterator
                     try:
                         val = next(iterator)
                         stack.append(val)
@@ -986,25 +1212,33 @@ class VM:
                     self._heap.free(pid)
                 elif op == LOAD_DEREF:
                     pid = stack.pop()
-                    index = stack.pop() if stack else 0
-                    stack.append(self._heap.load(pid, index))
+                    stack.append(self._heap.load(pid, 0))
                 elif op == STORE_DEREF:
-                    value = stack.pop()
+                    # compiler pushes (value, pointer) — pop the pointer first
                     pid = stack.pop()
-                    index = stack.pop() if stack else 0
-                    self._heap.store(pid, value, index)
+                    value = stack.pop()
+                    self._heap.store(pid, value, 0)
 
                 # ── advanced ──
                 elif op == MAKE_STRUCT:
                     name_idx = _read_u16()
-                    field_count = _read_u8()
-                    name = constants[name_idx]
-                    # Create a callable struct type (not an instance)
-                    field_names = [f"field{i}" for i in range(field_count)]
+                    _field_count = _read_u8()
+                    descriptor = constants[name_idx]
+                    if isinstance(descriptor, tuple) and len(descriptor) == 2:
+                        name, field_names = descriptor[0], list(descriptor[1])
+                    else:
+                        name = descriptor
+                        field_names = [f"field{i}" for i in range(_field_count)]
 
-                    def _make_struct_factory(_n=name, _fn=field_names):
-                        def _factory(*args):
+                    def _make_struct_factory(_n=name, _fn=tuple(field_names)):
+                        def _factory(*args, **kwargs):
                             fields = dict(zip(_fn, args))
+                            for k, v in kwargs.items():
+                                if k not in _fn:
+                                    raise ExternumError(f"struct `{_n}` has no field `{k}`")
+                                fields[k] = v
+                            for f in _fn:
+                                fields.setdefault(f, None)
                             return ExternumStruct(_n, fields)
 
                         return _factory
@@ -1013,20 +1247,15 @@ class VM:
                 elif op == MAKE_ENUM:
                     name_idx = _read_u16()
                     variant_count = _read_u8()
-                    name = constants[name_idx]
-
-                    # Create class with dynamic variant access
-                    class _EnumMeta(type):
-                        def __getattr__(cls, vname):
-                            if vname.startswith("_"):
-                                raise AttributeError(vname)
-
-                            def factory(v=None):
-                                return ExternumEnum(name, vname, v)
-
-                            return factory
-
-                    stack.append(_EnumMeta(name, (), {"__qualname__": name}))
+                    descriptor = constants[name_idx]
+                    if isinstance(descriptor, tuple) and len(descriptor) == 2:
+                        name, variant_names = descriptor[0], list(descriptor[1])
+                    else:
+                        name, variant_names = descriptor, []
+                    # Each variant is a value *and* a constructor (ExternumEnum.__call__).
+                    attrs = {v: ExternumEnum(name, v) for v in variant_names}
+                    attrs["__qualname__"] = name
+                    stack.append(type(name, (), attrs))
                 elif op == ENUM_VARIANT:
                     variant_idx = _read_u16()
                     variant = constants[variant_idx]
@@ -1061,10 +1290,9 @@ class VM:
                 elif op == DEFER_PUSH:
                     fn_idx = _read_u16()
                     fn = all_fns[fn_idx]
-                    if self._defer_stack:
-                        self._defer_stack[-1].append(fn)
-                    else:
-                        self._defer_stack.append([fn])
+                    if not self._defer_stack:
+                        self._defer_stack.append([])
+                    self._defer_stack[-1].append(fn)
 
                 elif op == OPTION_SOME:
                     val = stack.pop()
@@ -1086,6 +1314,20 @@ class VM:
                     for _ in range(argc):
                         args.insert(0, stack.pop())
                     stack.append(self._call_intrinsic(code, args))
+
+                elif op == INTRINSIC_EX:
+                    code = _read_u16()
+                    argc = _read_u8()
+                    nkw = _read_u8()
+                    kwargs = {}
+                    for _ in range(nkw):
+                        value = stack.pop()
+                        key = stack.pop()
+                        kwargs[key] = value
+                    args = []
+                    for _ in range(argc):
+                        args.insert(0, stack.pop())
+                    stack.append(self._call_intrinsic(code, args, kwargs))
 
                 elif op == ASSERT_EQ:
                     val = stack.pop()
@@ -1160,9 +1402,9 @@ class VM:
                     target = catch_stack.pop()
                     self._current_ip = target
                     ip = target
-                    # push the exception message so `except` handlers that bind
-                    # a value (if later extended) can access it
-                    stack.append(str(exc))
+                    # Push the exception object so `except ... as e` can bind it
+                    # and type filters (`except ValueError:`) can match on it.
+                    stack.append(exc)
                     continue
                 raise
         return stack.pop() if stack else None
@@ -1191,9 +1433,10 @@ class VM:
                 return call_line, 1
         return 0, 0
 
-    def _call_intrinsic(self, code: int, args: list) -> Any:
+    def _call_intrinsic(self, code: int, args: list, kwargs: dict = None) -> Any:
+        kwargs = kwargs or {}
         if code == 0:
-            return self._builtin_print(*args)
+            return self._builtin_print(*args, **kwargs)
         elif code == 1:
             return self._builtin_len(*args)
         elif code == 2:
@@ -1262,7 +1505,7 @@ class VM:
         elif code == 35:  # Option.None
             return ExternumOption(False, None)
         elif code == 40:
-            return self._builtin_sorted(*args)
+            return self._builtin_sorted(*args, **kwargs)
         elif code == 41:
             return self._builtin_enumerate(*args)
         elif code == 42:
@@ -1270,11 +1513,11 @@ class VM:
         elif code == 43:
             return self._builtin_reversed(*args)
         elif code == 44:
-            return self._builtin_min(*args)
+            return self._builtin_min(*args, **kwargs)
         elif code == 45:
-            return self._builtin_max(*args)
+            return self._builtin_max(*args, **kwargs)
         elif code == 46:
-            return self._builtin_sum(*args)
+            return self._builtin_sum(*args, **kwargs)
         elif code == 47:
             return self._builtin_abs(*args)
         elif code == 48:
@@ -1297,6 +1540,9 @@ class VM:
             return self._builtin_repr(*args)
         elif code == 57:
             return self._builtin_id(*args)
+        elif code == 58:  # super()
+            inst = self._instance_stack[-1] if self._instance_stack else None
+            return ExternumSuper(inst)
         # Terminal intrinsics (codes 60-74)
         elif code == 60:
             return self._builtin_term_init(*args)
@@ -1415,15 +1661,15 @@ class VM:
     def _builtin_hash(self, obj):
         return hash(obj)
 
-    def _builtin_min(self, *args):
-        return min(*args) if args else 0
+    def _builtin_min(self, *args, **kwargs):
+        return min(*args, **kwargs) if args else 0
 
-    def _builtin_max(self, *args):
-        return max(*args) if args else 0
+    def _builtin_max(self, *args, **kwargs):
+        return max(*args, **kwargs) if args else 0
 
-    def _builtin_sum(self, *args):
+    def _builtin_sum(self, *args, **kwargs):
         if len(args) == 1 and hasattr(args[0], "__iter__"):
-            return sum(args[0])
+            return sum(args[0], **kwargs)
         return sum(args)
 
     def _builtin_abs(self, obj):

@@ -110,7 +110,8 @@ class Compiler:
                 fields.append((fname, ftype))
         self.output["python"].append(f"{self._i()}class {name}:")
         self.indent += 1
-        self.output["python"].append(f"{self._i()}def __init__(self{', '.join(f'{fn}: {ft}' for fn, ft in fields)}):")
+        params = ", ".join(f"{fn}: {ft}" for fn, ft in fields)
+        self.output["python"].append(f"{self._i()}def __init__(self{', ' + params if params else ''}):")
         self.indent += 1
         for fn, ft in fields:
             self.output["python"].append(f"{self._i()}self.{fn} = {fn}")
@@ -123,7 +124,8 @@ class Compiler:
         self.indent -= 1
 
     def _compile_ENUM(self, node: ASTNode):
-        """enum Name { Variant(T), Variant2 } → Python class with classmethods."""
+        """enum Name: Variant(T), Variant2 → Python class whose variants are
+        values *and* constructors (`Color.Red` / `Color.Red()`)."""
         name = node.value
         self.output["python"].append(f"{self._i()}class {name}:")
         self.indent += 1
@@ -134,19 +136,31 @@ class Compiler:
         self.output["python"].append(f"{self._i()}self.name = name")
         self.output["python"].append(f"{self._i()}self.data = data")
         self.indent -= 1
+        self.output["python"].append(f"{self._i()}def __call__(self, data=None):")
+        self.indent += 1
+        self.output["python"].append(f"{self._i()}return {name}._Variant(self.name, data)")
+        self.indent -= 1
+        self.output["python"].append(f"{self._i()}def __eq__(self, other):")
+        self.indent += 1
+        self.output["python"].append(
+            f"{self._i()}return isinstance(other, {name}._Variant) and (self.name, self.data) == (other.name, other.data)"
+        )
+        self.indent -= 1
+        self.output["python"].append(f"{self._i()}def __hash__(self):")
+        self.indent += 1
+        self.output["python"].append(f"{self._i()}return hash((self.name, repr(self.data)))")
+        self.indent -= 1
         self.output["python"].append(f"{self._i()}def __repr__(self):")
         self.indent += 1
-        self.output["python"].append(f"{self._i()}return f'{{self.name}}({{self.data!r}})' if self.data else self.name")
+        self.output["python"].append(
+            f"{self._i()}return f'{name}.{{self.name}}({{self.data!r}})' if self.data is not None else f'{name}.{{self.name}}'"
+        )
         self.indent -= 1
         self.indent -= 1
         for child in node.children:
             if child.type == "VARIANT":
                 vname = child.value
-                self.output["python"].append(f"{self._i()}@classmethod")
-                self.output["python"].append(f"{self._i()}def {vname}(cls, data=None):")
-                self.indent += 1
-                self.output["python"].append(f"{self._i()}return cls._Variant('{vname}', data)")
-                self.indent -= 1
+                self.output["python"].append(f"{self._i()}{vname} = _Variant('{vname}')")
         self.indent -= 1
 
     def _compile_MOD(self, node: ASTNode):
@@ -178,8 +192,7 @@ class Compiler:
         self.indent -= 1
 
     def _compile_DEFER(self, node: ASTNode):
-        """defer: body → wrap in try/finally at function level."""
-        # Simplified: just compile as-is (the body runs immediately)
+        """defer at module scope: run the body once, at the end of the module."""
         for child in node.children:
             self._compile_node(child)
 
@@ -346,8 +359,31 @@ class Compiler:
             params = node.children[0].value
         self.output["python"].append(f"{self._i()}def {node.value}({params}):")
         self.indent += 1
-        for child in node.children[1:]:
-            self._compile_node(child)
+        body = node.children[1:]
+        defers = [c for c in body if c.type == "DEFER"]
+        rest = [c for c in body if c.type != "DEFER"]
+        if not defers:
+            for child in body:
+                self._compile_node(child)
+            self.indent -= 1
+            return
+        # `defer` runs on every exit path → real try/finally.
+        self.output["python"].append(f"{self._i()}try:")
+        self.indent += 1
+        if rest:
+            for child in rest:
+                self._compile_node(child)
+        else:
+            self.output["python"].append(f"{self._i()}pass")
+        self.indent -= 1
+        self.output["python"].append(f"{self._i()}finally:")
+        self.indent += 1
+        if not any(d.children for d in defers):
+            self.output["python"].append(f"{self._i()}pass")
+        for deferred in reversed(defers):
+            for child in deferred.children:
+                self._compile_node(child)
+        self.indent -= 1
         self.indent -= 1
 
     def _compile_CLASS(self, node: ASTNode):
@@ -492,6 +528,13 @@ class Compiler:
             self.output["python"].append(f"{self._i()}return {self._value_to_str(node.children[0])}")
         else:
             self.output["python"].append(f"{self._i()}return")
+
+    def _compile_WALRUS(self, node: ASTNode):
+        """`n := expr` as a statement — assign, discard nothing."""
+        if len(node.children) >= 2:
+            name = self._value_to_str(node.children[0])
+            val = self._value_to_str(node.children[1])
+            self.output["python"].append(f"{self._i()}{name} := {val}")
 
     def _compile_YIELD(self, node: ASTNode):
         if node.children:
@@ -692,6 +735,8 @@ class Compiler:
         if t == "DEREF":
             inner = self._value_to_str(node.children[0]) if node.children else "None"
             return f"_ext_load({inner})"
+        if t == "WALRUS":
+            return f"({node.value})"
         if t == "KWARG":
             return f"{node.value}={self._value_to_str(node.children[0]) if node.children else 'None'}"
         if t == "STAR":

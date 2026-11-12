@@ -14,8 +14,8 @@ One source compiles to EXBC bytecode and runs on the Externum VM,
 or can still be transpiled to Python for compatibility.
 """
 
-__version__ = "4.3.1"
-__codename__ = "Abyss"
+__version__ = "4.4.0"
+__codename__ = "Titan"
 
 from .analysis import check, check_or_raise, preprocess
 from .bytecode import BytecodeCompiler, BytecodeFunction, BytecodeModule

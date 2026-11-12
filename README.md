@@ -24,7 +24,7 @@
 
 <div align="center">
 
-[![Typing SVG](https://readme-typing-svg.demolab.com/?font=JetBrains+Mono&weight=600&size=18&duration=3000&pause=1200&color=58A6FF&center=true&vCenter=true&width=600&height=45&lines=Programming%20language%20%E2%80%94%20compiles%20to%20Python%2C%20Bash%2C%20binary.%20379%20tests%2C%20browser%20REPL%2C%20DRM%2C%20ownership%2Btraits%20)](https://github.com/BartoszOsiej/externum)
+[![Typing SVG](https://readme-typing-svg.demolab.com/?font=JetBrains+Mono&weight=600&size=18&duration=3000&pause=1200&color=58A6FF&center=true&vCenter=true&width=600&height=45&lines=Programming%20language%20%E2%80%94%20compiles%20to%20Python%2C%20Bash%2C%20binary.%20452%20tests%2C%20browser%20REPL%2C%20DRM%2C%20ownership%2Btraits%20)](https://github.com/BartoszOsiej/externum)
 
 </div># ⚡ Externum
 
@@ -33,7 +33,7 @@
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python)
 ![PyPI](https://img.shields.io/pypi/v/externum?style=flat-square&logo=pypi&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-382%20✓-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/Tests-452%20✓-brightgreen?style=flat-square)
 ![Docker](https://img.shields.io/badge/Docker-GHCR-2496ED?style=flat-square&logo=docker)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](https://github.com/BartoszOsiej/externum/blob/main/LICENSE)
 
@@ -122,7 +122,7 @@ Linux 7.2.4-arch1-2
 
 ```bash
 pip install externum        # PyPI
-externum --version          # Externum 4.1.0
+externum --version          # Externum 4.4.0
 
 # From source
 git clone https://github.com/BartoszOsiej/externum.git
@@ -301,7 +301,7 @@ externum/
 lib/                  # Standard library (.ext)
 tools/                # Tooling in Externum
 examples/             # hello, calc, pokedex, hardcore.ext
-tests/                # 379 unit tests
+tests/                # 452 unit tests
 docs/WIKI.md          # Language specification
 ```
 
@@ -310,7 +310,7 @@ docs/WIKI.md          # Language specification
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 382 tests
+python3 -m unittest discover -s tests -v   # 452 tests
 ```
 
 ---

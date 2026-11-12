@@ -10,6 +10,79 @@ every compiled program, so `.ext` code can use `alloc`, `free`, `@p`,
 import itertools
 import queue
 import threading
+import typing
+
+
+# ------------------------------------------------------- algebraic types
+class _ExtResult:
+    """Ok(value) / Err(value) — result type available in every program."""
+
+    __slots__ = ("ok", "value")
+
+    def __init__(self, ok, value):
+        self.ok = ok
+        self.value = value
+
+    def unwrap(self):
+        if not self.ok:
+            raise RuntimeError(f"unwrap on Err: {self.value!r}")
+        return self.value
+
+    def is_ok(self):
+        return self.ok
+
+    def __eq__(self, other):
+        return isinstance(other, _ExtResult) and (self.ok, self.value) == (other.ok, other.value)
+
+    def __hash__(self):
+        return hash((self.ok, repr(self.value)))
+
+    def __repr__(self):
+        return f"Ok({self.value!r})" if self.ok else f"Err({self.value!r})"
+
+
+class _ExtOption:
+    """Some(value) / None — optional type available in every program."""
+
+    __slots__ = ("some", "value")
+
+    def __init__(self, some, value=None):
+        self.some = some
+        self.value = value
+
+    def unwrap(self):
+        if not self.some:
+            raise RuntimeError("unwrap on None")
+        return self.value
+
+    def is_some(self):
+        return self.some
+
+    def __eq__(self, other):
+        return isinstance(other, _ExtOption) and (self.some, self.value) == (other.some, other.value)
+
+    def __hash__(self):
+        return hash((self.some, repr(self.value)))
+
+    def __repr__(self):
+        return f"Some({self.value!r})" if self.some else "None"
+
+
+def _ext_ok(value=None):
+    return _ExtResult(True, value)
+
+
+def _ext_err(value=None):
+    return _ExtResult(False, value)
+
+
+def _ext_some(value=None):
+    return _ExtOption(True, value)
+
+
+def _ext_none():
+    return _ExtOption(False, None)
+
 
 # ---------------------------------------------------------------- memory heap
 # A tiny, explicit heap. A "pointer" is an integer id into this dict.
@@ -28,17 +101,18 @@ _SIZEOF = {"Int": 8, "Float": 8, "Str": 16, "Bool": 1, "Ptr": 8}
 # below are deliberately conservative and are NOT lowered silently in future
 # releases without a deliberate decision.
 # ---------------------------------------------------------------------------
-_MAX_HEAP_SLOTS = 65536     # total heap cells the VM may hold at once
-_MAX_THREADS = 16            # concurrently executing _ext_spawn workers
-_MAX_FREED = 1024            # retained so double-free / re-free can be caught
-_heap_lock = threading.RLock()       # serialises heap + counter edits
-_heap_count = 0                      # live heap slots
-_freed_ids = set()                   # ids eligible for re-free
-_thread_pool = queue.Queue()         # running _ext_spawn workers
+_MAX_HEAP_SLOTS = 65536  # total heap cells the VM may hold at once
+_MAX_THREADS = 16  # concurrently executing _ext_spawn workers
+_MAX_FREED = 1024  # retained so double-free / re-free can be caught
+_heap_lock = threading.RLock()  # serialises heap + counter edits
+_heap_count = 0  # live heap slots
+_freed_ids = set()  # ids eligible for re-free
+_thread_pool = queue.Queue()  # running _ext_spawn workers
 
 
 def _bounded(f):
     """Thin guard: fail-closed on over-run.  Internal-only; callers are trusted."""
+
     def wrapper(*a, **kw):
         with _heap_lock:
             if _heap_count >= _MAX_HEAP_SLOTS:
@@ -47,6 +121,7 @@ def _bounded(f):
                 raise RuntimeError("spawn: thread cap reached")
             n = f(*a, **kw)
         return n
+
     return wrapper
 
 
@@ -129,11 +204,13 @@ def _ext_recv(ch):
 def _ext_spawn(fn):
     """Run `fn` on a daemon thread, capped by _MAX_THREADS."""
     global _thread_pool
+
     def _runner():
         try:
             fn()
         finally:
             _thread_pool.task_done()
+
     _thread_pool.put(_runner)
     threading.Thread(target=_runner, daemon=True).start()
     return _thread_pool.qsize()
@@ -171,4 +248,22 @@ def externum_globals() -> dict:
         "_ext_traits": _ext_traits,
         "_ext_impls": _ext_impls,
         "_ext_impls_of": _ext_impls_of,
+        # algebraic types (first-class in every program)
+        "Ok": _ext_ok,
+        "Err": _ext_err,
+        "Some": _ext_some,
+        "Result": _ExtResult,
+        "Option": _ExtOption,
+        # type names usable in annotations (Int, Str, List[...], ...)
+        "Int": int,
+        "Float": float,
+        "Str": str,
+        "Bool": bool,
+        "Void": type(None),
+        "Any": object,
+        "Ptr": int,
+        "List": list,
+        "Dict": dict,
+        "Optional": typing.Optional,
+        "Union": typing.Union,
     }

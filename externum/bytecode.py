@@ -101,11 +101,15 @@ CALL = 0x50
 CALL_KW = 0x51
 MAKE_FN = 0x54
 MAKE_CLASS = 0x55
+CALL_EX = 0x56  # fn, args-list, kwargs-dict  (star/kwargs aware call)
 
 GET_ATTR = 0x60
 SET_ATTR = 0x61
 GET_INDEX = 0x62
 SET_INDEX = 0x63
+DEL_INDEX = 0x64
+DEL_ATTR = 0x65
+DEL_NAME = 0x66
 
 MAKE_LIST = 0x70
 MAKE_DICT = 0x71
@@ -113,6 +117,12 @@ MAKE_TUPLE = 0x72
 MAKE_SET = 0x73
 UNPACK = 0x74
 SLICE = 0x75
+LIST_APPEND = 0x76  # container, value -> container
+LIST_EXTEND = 0x77  # container, iterable -> container
+SET_ADD = 0x78  # container, value -> container
+DICT_SET = 0x79  # container, key, value -> container
+DICT_UPDATE = 0x7A  # container, mapping -> container
+LIST_TO_TUPLE = 0x7B
 
 FOR_ITER = 0x80
 LOOP_BREAK = 0x83
@@ -157,6 +167,7 @@ TRACE_OP = 0xE4
 DBG_OP = 0xE5
 
 INTRINSIC = 0xF0
+INTRINSIC_EX = 0xF1  # intrinsic with keyword arguments (print sep/end)
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -172,6 +183,7 @@ class BytecodeFunction:
     constants: list[Any] = field(default_factory=list)
     inner_fns: list["BytecodeFunction"] = field(default_factory=list)
     is_async: bool = False
+    is_generator: bool = False
     upvalues: list[str] = field(default_factory=list)
     line_table: dict[int, int] = field(default_factory=dict)  # bytecode_offset -> line
 
@@ -205,6 +217,10 @@ class BytecodeCompiler:
         self._defer_stack: list[list[int]] = []  # stack of defer instruction offsets
         self._try_depth = 0
         self._line = 1
+        self._comp_counter = 0
+        # Statement lists that must run before leaving a try/finally block
+        # (return/break/continue inside `try`). Innermost last.
+        self._finally_stack: list[list[ASTNode]] = []
 
     # ── public API ──────────────────────────────────────────────────
     def compile(self) -> BytecodeModule:
@@ -251,6 +267,15 @@ class BytecodeCompiler:
         else:
             self.module.line_table[offset] = self._line
         return offset
+
+    def _emit3(self, op: int, idx: int, b1: int, b2: int):
+        """Emit opcode + u16 index + two u8 bytes (INTRINSIC_EX)."""
+        target = self._current_fn.bytecode if self._current_fn else self.module.bytecode
+        target.append(op & 0xFF)
+        target.extend(struct.pack(">H", idx & 0xFFFF))
+        target.append(b1 & 0xFF)
+        target.append(b2 & 0xFF)
+        return None
 
     def _emit_jump(self, op: int) -> int:
         """Emit a jump instruction and return the offset of the operand (for patching)."""
@@ -319,9 +344,7 @@ class BytecodeCompiler:
             self._compile_expr(node)
             self._emit(POP)
         elif t == "DEL":
-            if node.children:
-                self._compile_expr(node.children[0])
-                self._emit(POP)
+            self._stmt_DEL(node)
         else:
             # generic: compile expression children
             for child in node.children:
@@ -331,7 +354,16 @@ class BytecodeCompiler:
     def _stmt_ASSIGN(self, node: ASTNode):
         if node.value:  # tuple unpacking: "a, b = expr"
             names = [n.strip() for n in node.value.split(",") if n.strip()]
-            self._compile_expr(node.children[0] if node.children else ASTNode("IDENTIFIER", value="None"))
+            rhs = node.children[0] if node.children else ASTNode("IDENTIFIER", value="None")
+            text = str(rhs.value or "")
+            items = self._parse_list_items(text) if ("," in text and rhs.type in ("EXPRESSION", "TUPLE")) else None
+            if items and len(items) > 1:
+                # `a, b = 1, 2` — the RHS arrives as the verbatim text "1, 2".
+                for item in items:
+                    self._compile_simple_expr(item.strip())
+                self._emit(MAKE_TUPLE, len(items))
+            else:
+                self._compile_expr(rhs)
             self._emit(UNPACK, len(names))
             for name in reversed(names):
                 kind, _ = self._resolve(name)
@@ -346,7 +378,22 @@ class BytecodeCompiler:
             return
         target = node.children[0]
         value = node.children[1] if len(node.children) > 1 else None
-        if value:
+        if target.type == "INDEX":
+            # obj[i] = val — evaluate receiver and index *before* the value so
+            # SET_INDEX sees (obj, idx, val). The old order evaluated the value
+            # first, so `d["k"] = 1; d["k"] += 1` wrote into the wrong slot.
+            inner = str(target.value)
+            bracket = inner.find("[")
+            if bracket > 0:
+                self._compile_simple_expr(inner[:bracket].strip())
+                self._compile_simple_expr(inner[bracket + 1 : -1].strip())
+                if value is not None:
+                    self._compile_expr(value)
+                else:
+                    self._emit(LOAD_CONST, self._add_const(None))
+                self._emit(SET_INDEX)
+                return
+        if value is not None:
             self._compile_expr(value)
         else:
             self._emit(LOAD_CONST, self._add_const(None))
@@ -369,17 +416,9 @@ class BytecodeCompiler:
                 attr_idx = self._add_const(parts[1])
                 self._emit(SET_ATTR, attr_idx)
         elif target.type == "INDEX":
-            # obj[i] = val — target.value is like "x[0]"
-            inner = target.value
-            bracket = inner.find("[")
-            if bracket > 0:
-                self._compile_name(inner[:bracket])
-                idx_expr = inner[bracket + 1 : -1]
-                self._compile_simple_expr(idx_expr)
-                self._emit(SWAP)  # obj, idx, val → obj, val, idx
-                # rearrange: obj, val, idx → obj, idx, val
-                self._emit(SWAP)
-                self._emit(SET_INDEX)
+            # Unparseable index target: drop the already-pushed value instead
+            # of leaving the stack unbalanced.
+            self._emit(POP)
         elif target.type == "DEREF":
             if target.children:
                 self._compile_expr(target.children[0])
@@ -484,10 +523,14 @@ class BytecodeCompiler:
             self._declare_var(a)
 
         old_line = self._line
+        old_saw_yield = getattr(self, "_saw_yield", False)
+        self._saw_yield = False
         if getattr(node, "line", 0):
             self._line = node.line
         for child in body_nodes:
             self._compile_stmt(child)
+        fn.is_generator = self._saw_yield
+        self._saw_yield = old_saw_yield
         self._emit(RETURN)
         self._line = old_line
 
@@ -510,26 +553,24 @@ class BytecodeCompiler:
         name = node.value
         bases = ""
         if node.children and node.children[0].type == "PARAMS":
-            bases = node.children[0].value
+            bases = str(node.children[0].value or "")
         body = node.children[1:] if node.children and node.children[0].type == "PARAMS" else node.children
 
-        # Compile each method as a function
+        # Compile each method as a function; collect plain class attributes too
         methods = []
+        attributes = []
         for child in body:
             if child.type == "FUNCTION":
                 self._compile_function_def(child)
                 methods.append(child.value)
-            elif child.type == "ASSIGN":
-                # class-level attribute assignment
-                pass
+            elif child.type in ("ASSIGN", "CONST") and child.value:
+                attributes.append(child)
 
-        # Now create the class
-        self._emit(LOAD_CONST, self._add_const(name))
-        self._emit(MAKE_CLASS, self._add_const(name))
-
-        # For each compiled method, get it from the stack and set as class attr
-        # The methods were compiled as top-level functions; now attach them
-        class_idx = len(self._stack_tracker) if hasattr(self, "_stack_tracker") else 0
+        # Base classes are pushed first so MAKE_CLASS can link the MRO.
+        base_names = [b.strip().split("[")[0].strip() for b in bases.split(",") if b.strip()]
+        for base in base_names:
+            self._compile_name(base)
+        self._emit2(MAKE_CLASS, self._add_const(name), len(base_names))
 
         # Store class name
         idx = self._add_const(name)
@@ -542,6 +583,20 @@ class BytecodeCompiler:
         else:
             self._emit(STORE_VAR, idx)
         self._declare_var(name)
+
+        # Class-level attributes (evaluated once, at class creation)
+        for attr in attributes:
+            target = attr.children[0] if attr.children else None
+            value = attr.children[1] if len(attr.children) > 1 else None
+            aname = str(target.value) if target is not None else None
+            if not aname:
+                continue
+            self._compile_name(name)
+            if value is not None:
+                self._compile_expr(value)
+            else:
+                self._emit(LOAD_CONST, self._add_const(None))
+            self._emit(SET_ATTR, self._add_const(aname))
 
         # Now set each method on the class
         for mname in methods:
@@ -661,45 +716,115 @@ class BytecodeCompiler:
             self._patch_jump(bp)
 
     def _stmt_TRY(self, node: ASTNode):
+        body = [c for c in node.children if c.type not in ("EXCEPT", "TRY_ELSE", "FINALLY")]
+        handlers = [c for c in node.children if c.type == "EXCEPT"]
+        else_block = next((c for c in node.children if c.type == "TRY_ELSE"), None)
+        finally_block = next((c for c in node.children if c.type == "FINALLY"), None)
+
         try_start = self._emit_jump(TRY_BEGIN)
-        for child in node.children:
-            if child.type not in ("EXCEPT", "TRY_ELSE", "FINALLY"):
-                self._compile_stmt(child)
+        self._finally_stack.append(finally_block.children if finally_block is not None else [])
+        for child in body:
+            self._compile_stmt(child)
+        self._finally_stack.pop()
         self._emit(TRY_END)
+        if else_block is not None:
+            for sub in else_block.children:
+                self._compile_stmt(sub)
         end_patches = [self._emit_jump(JUMP)]
+
+        # Handler chain: the VM unwinds with the exception object on the stack.
         self._patch_jump(try_start)
-        for child in node.children:
-            if child.type == "EXCEPT":
-                # except Type as e: body
-                for sub in child.children:
-                    if sub.type == "AS_VAR":
-                        self._declare_var(sub.value)
-                for sub in child.children:
-                    if sub.type not in ("COND", "AS_VAR"):
-                        self._compile_stmt(sub)
-                self._emit(POP_EXCEPT)
+        for handler in handlers:
+            cond = next((c for c in handler.children if c.type == "COND"), None)
+            as_var = next((c for c in handler.children if c.type == "AS_VAR"), None)
+            hbody = [c for c in handler.children if c.type not in ("COND", "AS_VAR")]
+            if cond is not None and cond.children:
+                self._compile_exception_test(str(cond.children[0].value))
+                skip = self._emit_jump(JUMP_IF_NOT)
+            else:
+                skip = None
+            if as_var is not None:
+                self._store_var(str(as_var.value))
+            else:
+                self._emit(POP)
+            self._finally_stack.append(finally_block.children if finally_block is not None else [])
+            for sub in hbody:
+                self._compile_stmt(sub)
+            self._finally_stack.pop()
+            end_patches.append(self._emit_jump(JUMP))
+            if skip is not None:
+                self._patch_jump(skip)
+        # No handler matched: re-raise the exception still sitting on the stack.
+        self._emit(RAISE_OP)
+
         for p in end_patches:
             self._patch_jump(p)
+        if finally_block is not None:
+            for sub in finally_block.children:
+                self._compile_stmt(sub)
+
+    def _compile_exception_test(self, type_text: str):
+        """Stack: [exc] → [exc, bool] — does exc match the except clause type?"""
+        names = [n.strip() for n in type_text.strip().strip("()").split(",") if n.strip()]
+        self._emit(DUP)
+        self._emit2(INTRINSIC, 6, 1)  # type(exc) -> class name string in the VM
+        self._emit(
+            LOAD_CONST, self._add_const(tuple(names) if len(names) > 1 else (names[0] if names else "Exception"))
+        )
+        self._emit(IN_OP)
+
+    def _emit_pending_finalizers(self):
+        for block in reversed(self._finally_stack):
+            for stmt in block:
+                self._compile_stmt(stmt)
 
     def _stmt_RETURN(self, node: ASTNode):
         if node.children:
             self._compile_expr(node.children[0])
         else:
             self._emit(LOAD_CONST, self._add_const(None))
+        self._emit_pending_finalizers()
         self._emit(RETURN)
 
     def _stmt_BREAK(self, node: ASTNode):
+        self._emit_pending_finalizers()
         jf = self._emit_jump(LOOP_BREAK)
         if self._loop_stack:
             self._loop_stack[-1].append(jf)
 
     def _stmt_CONTINUE(self, node: ASTNode):
+        self._emit_pending_finalizers()
         if self._loop_start_stack:
             jf = self._emit_jump(JUMP)
             self._patch_jump_to(jf, self._loop_start_stack[-1])
 
     def _stmt_PASS(self, node: ASTNode):
         self._emit(NOP)
+
+    def _stmt_DEL(self, node: ASTNode):
+        """del name / del obj.attr / del obj[i]"""
+        if not node.children:
+            return
+        target = node.children[0]
+        if target.type == "INDEX":
+            inner = str(target.value)
+            bracket = inner.find("[")
+            if bracket > 0:
+                self._compile_simple_expr(inner[:bracket].strip())
+                self._compile_simple_expr(inner[bracket + 1 : -1].strip())
+                self._emit(DEL_INDEX)
+                return
+        elif target.type == "DOT":
+            parts = str(target.value).rsplit(".", 1)
+            if len(parts) == 2:
+                self._compile_simple_expr(parts[0])
+                self._emit(DEL_ATTR, self._add_const(parts[1]))
+                return
+        elif target.type == "IDENTIFIER":
+            self._emit(DEL_NAME, self._add_const(str(target.value)))
+            return
+        self._compile_expr(target)
+        self._emit(POP)
 
     def _stmt_IMPORT(self, node: ASTNode):
         idx = self._add_const(node.value)
@@ -739,35 +864,69 @@ class BytecodeCompiler:
 
         end_patches = []
         for child in node.children[1:]:
-            if child.type == "CASE":
+            if child.type != "CASE":
+                continue
+            pattern = child.children[0].value if child.children else "_"
+            guard = next((c for c in child.children[1:] if c.type == "GUARD"), None)
+            body = [c for c in child.children[1:] if c.type != "GUARD"]
+            pat = str(pattern).strip()
+            skip = None
+            bindings: list[str] = []
+
+            if pat in ("_", ""):
+                pass  # wildcard: always matches
+            elif pat.isidentifier() and pat not in ("True", "False", "None"):
+                # binding pattern: `case n:` binds the subject
                 self._compile_name(subject_name)
-                pat = child.children[0].value if child.children else "_"
-                if pat == "_":
-                    # wildcard — always matches
-                    self._emit(POP)
-                    for sub in child.children[1:]:
-                        if sub.type != "GUARD":
-                            self._compile_stmt(sub)
-                    end_patches.append(self._emit_jump(JUMP))
-                else:
-                    # Try to convert numeric patterns to actual numbers
-                    pat_val = pat
+                self._store_var(pat)
+                bindings.append(pat)
+            elif pat.startswith(("[", "(")) and pat.endswith(("]", ")")):
+                # destructuring: `case [a, b]:`
+                inner = pat[1:-1]
+                names = [n.strip() for n in inner.split(",") if n.strip()]
+                self._compile_name(subject_name)
+                self._emit(UNPACK, len(names))
+                for name in reversed(names):
+                    self._store_var(name)
+                    bindings.append(name)
+            else:
+                # literal / alternation: `case 1:` or `case "a" | "b":`
+                alternatives = []
+                for alt in (a.strip() for a in pat.split("|")):
+                    if not alt:
+                        continue
+                    alt_val = alt
                     try:
-                        pat_val = int(pat)
+                        alt_val = int(alt)
                     except (ValueError, TypeError):
                         try:
-                            pat_val = float(pat)
+                            alt_val = float(alt)
                         except (ValueError, TypeError):
-                            pass
-                    pat_idx = self._add_const(pat_val)
-                    self._emit(LOAD_CONST, pat_idx)
-                    self._emit(EQ)
-                    jf = self._emit_jump(JUMP_IF_NOT)
-                    for sub in child.children[1:]:
-                        if sub.type != "GUARD":
-                            self._compile_stmt(sub)
-                    end_patches.append(self._emit_jump(JUMP))
-                    self._patch_jump(jf)
+                            if len(alt) >= 2 and alt[0] == alt[-1] and alt[0] in ('"', "'"):
+                                alt_val = alt[1:-1]
+                    alternatives.append(alt_val)
+                self._compile_name(subject_name)
+                self._emit(DUP)
+                self._emit(
+                    LOAD_CONST,
+                    self._add_const(tuple(alternatives) if alternatives else (pat,)),
+                )
+                self._emit(IN_OP)
+                skip = self._emit_jump(JUMP_IF_NOT)
+                self._emit(POP)  # drop the duplicated subject
+
+            guard_skip = None
+            if guard is not None and guard.children:
+                self._compile_expr(guard.children[0])
+                guard_skip = self._emit_jump(JUMP_IF_NOT)
+
+            for sub in body:
+                self._compile_stmt(sub)
+            end_patches.append(self._emit_jump(JUMP))
+            if guard_skip is not None:
+                self._patch_jump(guard_skip)
+            if skip is not None:
+                self._patch_jump(skip)
         for p in end_patches:
             self._patch_jump(p)
 
@@ -778,11 +937,9 @@ class BytecodeCompiler:
             if hasattr(child, "value"):
                 fields.append(child.value.split(":")[0].strip() if ":" in str(child.value) else str(child.value))
         self.module.structs[name] = {"fields": fields}
-        # Emit MAKE_STRUCT
-        self._emit2(MAKE_STRUCT, self._add_const(name), len(fields))
-        idx = self._add_const(name)
-        self._emit(STORE_VAR, idx)
-        self._declare_var(name)
+        # Pass the real field names so instances expose `P.x`, not `P.field0`.
+        self._emit2(MAKE_STRUCT, self._add_const((name, tuple(fields))), len(fields))
+        self._store_var(name)
 
     def _stmt_ENUM(self, node: ASTNode):
         name = node.value
@@ -791,13 +948,8 @@ class BytecodeCompiler:
             vname = child.value if hasattr(child, "value") else "Unknown"
             variants[vname] = []
         self.module.enums[name] = {"variants": variants}
-        self._emit2(MAKE_ENUM, self._add_const(name), len(variants))
-        idx = self._add_const(name)
-        if self._current_fn is None:
-            self._emit(STORE_GLOBAL, idx)
-        else:
-            self._emit(STORE_VAR, idx)
-        self._declare_var(name)
+        self._emit2(MAKE_ENUM, self._add_const((name, tuple(variants))), len(variants))
+        self._store_var(name)
 
     def _stmt_CONST(self, node: ASTNode):
         if node.children and len(node.children) >= 1:
@@ -828,15 +980,38 @@ class BytecodeCompiler:
         self._emit(DEFER_PUSH, fn_idx)
 
     def _stmt_YIELD(self, node: ASTNode):
+        self._saw_yield = True
         if node.children:
             self._compile_expr(node.children[0])
         self._emit(YIELD_VAL)
 
     def _stmt_WITH(self, node: ASTNode):
-        """with expr as var: body — simplified to try/finally."""
-        if node.children:
-            for child in node.children:
-                self._compile_stmt(child)
+        """with expr as var, ...: body — bind each context and close it after."""
+        raw = str(node.value or "")
+        items = []
+        for part in self._parse_list_items(raw) if raw else []:
+            part = part.strip()
+            if not part:
+                continue
+            if " as " in part:
+                expr, var = part.rsplit(" as ", 1)
+                items.append((expr.strip(), var.strip()))
+            else:
+                items.append((part, None))
+        bound = []
+        for i, (expr, var) in enumerate(items):
+            if var is None:
+                var = f"__with{i}__"
+            self._compile_simple_expr(expr)
+            self._store_var(var)
+            bound.append(var)
+        for child in node.children:
+            self._compile_stmt(child)
+        for var in reversed(bound):
+            self._compile_name(var)
+            self._emit(GET_ATTR, self._add_const("close"))
+            self._emit1(CALL, 0)
+            self._emit(POP)
 
     def _stmt_GLOBAL(self, node: ASTNode):
         pass  # already handled by scope resolution
@@ -883,6 +1058,26 @@ class BytecodeCompiler:
 
     def _expr_STRING(self, node: ASTNode):
         val = node.value
+        # Plain/triple/raw strings: let Python decode escapes (\n, \t, \\, …).
+        if isinstance(val, str) and val and val[0] in "'\"":
+            try:
+                self._emit(LOAD_CONST, self._add_const(_pyast.literal_eval(val)))
+                return
+            except (ValueError, SyntaxError):
+                pass
+        if isinstance(val, str) and len(val) >= 6:
+            # Triple-quoted strings: the lexer keeps the delimiters
+            for q in ('"""', "'''"):
+                if val.startswith(q) and val.endswith(q) and len(val) >= 6:
+                    self._emit(LOAD_CONST, self._add_const(val[3:-3]))
+                    return
+                prefixed = val[0] in "fFrRbBuU" and val[1:].startswith(q) and val.endswith(q)
+                if prefixed and len(val) >= 7:
+                    if val[0] in "fF":
+                        self._emit_fstring_body(val[4:-3])
+                    else:
+                        self._emit(LOAD_CONST, self._add_const(val[4:-3]))
+                    return
         if isinstance(val, str) and len(val) >= 2:
             if val[0] in "fF" and len(val) >= 4 and val[1] == val[-1] and val[1] in ('"', "'") and val[2] != val[1]:
                 # f-string: emit real interpolation (#24). The Python target
@@ -941,13 +1136,55 @@ class BytecodeCompiler:
             return
         for i, (is_expr, text) in enumerate(parts):
             if is_expr:
-                self._compile_simple_expr(text.strip())
-                self._emit2(INTRINSIC, 2, 1)  # str(x)
+                expr_text, conv, spec = self._split_fstring_expr(text.strip())
+                self._compile_simple_expr(expr_text)
+                if spec:
+                    # x.__format__(spec) — f"{x:.2f}" and friends
+                    self._emit(GET_ATTR, self._add_const("__format__"))
+                    self._emit(LOAD_CONST, self._add_const(spec))
+                    self._emit1(CALL, 1)
+                elif conv in ("r", "a"):
+                    self._emit(GET_ATTR, self._add_const("__repr__"))
+                    self._emit1(CALL, 0)
+                else:
+                    self._emit2(INTRINSIC, 2, 1)  # str(x)
             else:
                 self._emit(LOAD_CONST, self._add_const(text))
             if i > 0:
                 # ADD pops (b, a) -> a + b: both operands are on the stack
                 self._emit(ADD)
+
+    def _split_fstring_expr(self, text: str) -> tuple[str, str, str]:
+        """Split an f-string field into (expression, conversion, format-spec)."""
+        conv = ""
+        spec = ""
+        depth = 0
+        quote = None
+        conv_at = None
+        spec_at = None
+        for i, ch in enumerate(text):
+            if quote:
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = None
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif depth == 0 and ch == "!" and spec_at is None and conv_at is None:
+                conv_at = i
+            elif depth == 0 and ch == ":" and spec_at is None:
+                spec_at = i
+        end = min(x for x in (conv_at, spec_at, len(text)) if x is not None)
+        expr = text[:end]
+        if conv_at is not None:
+            conv_end = spec_at if spec_at is not None else len(text)
+            conv = text[conv_at + 1 : conv_end]
+        if spec_at is not None:
+            spec = text[spec_at + 1 :]
+        return expr, conv, spec
 
     def _expr_INTERP(self, node: ASTNode):
         """$"text {expr} more" → parts joined with str() + ADD.
@@ -992,6 +1229,16 @@ class BytecodeCompiler:
     def _expr_EXPRESSION(self, node: ASTNode):
         self._compile_simple_expr(str(node.value))
 
+    def _expr_WALRUS(self, node: ASTNode):
+        """`n := expr` — assign and leave the value on the stack."""
+        if len(node.children) < 2:
+            self._emit(LOAD_CONST, self._add_const(None))
+            return
+        name = str(node.children[0].value)
+        self._compile_expr(node.children[1])
+        self._emit(DUP)
+        self._store_var(name)
+
     def _expr_BINOP(self, node: ASTNode):
         op_node = node.children[1] if len(node.children) > 1 else None
         op = op_node.value if op_node else "+"
@@ -1020,6 +1267,18 @@ class BytecodeCompiler:
             self._patch_jump(jfalse)
             self._compile_expr(node.children[3])  # false value
             self._patch_jump(end)
+            return
+        if op == "not in":
+            self._compile_expr(node.children[0])
+            self._compile_expr(node.children[2])
+            self._emit(IN_OP)
+            self._emit(NOT)
+            return
+        if op == "is not":
+            self._compile_expr(node.children[0])
+            self._compile_expr(node.children[2])
+            self._emit(IS_OP)
+            self._emit(NOT)
             return
         self._compile_expr(node.children[0])
         self._compile_expr(node.children[2])
@@ -1114,6 +1373,7 @@ class BytecodeCompiler:
             "isinstance": 55,
             "repr": 56,
             "id": 57,
+            "super": 58,
             # Terminal builtins
             "term_init": 60,
             "term_cleanup": 61,
@@ -1131,82 +1391,285 @@ class BytecodeCompiler:
             "term_getstr": 73,
             "term_attr": 74,
         }
-        if fn in builtin_map:
-            # INTRINSIC: args pushed first, then opcode handles them
-            for child in node.children:
-                self._compile_expr(child)
-            self._emit2(INTRINSIC, builtin_map[fn], len(node.children))
+        kwargs = [c for c in node.children if c.type == "KWARG"]
+        starred = [c for c in node.children if c.type in ("STAR", "DSTAR")]
+        if fn in builtin_map and not starred:
+            positional = [c for c in node.children if c.type != "KWARG"]
+            if kwargs:
+                # print("a", end="") and friends: values then key/value pairs
+                for child in positional:
+                    self._compile_expr(child)
+                for kw in kwargs:
+                    self._emit(LOAD_CONST, self._add_const(str(kw.value)))
+                    self._compile_expr(kw.children[0])
+                self._emit3(INTRINSIC_EX, builtin_map[fn], len(positional), len(kwargs))
+            else:
+                for child in positional:
+                    self._compile_expr(child)
+                self._emit2(INTRINSIC, builtin_map[fn], len(positional))
         else:
             # User function: push fn first, then args (VM pops args then fn)
             # Handle dotted names like g.greet, Color.Red, o.unwrap
-            if "." in fn:
+            if fn == "super":
+                self._compile_name("super")
+            elif "." in fn:
                 parts = fn.rsplit(".", 1)
-                self._compile_name(parts[0])  # push obj
+                self._compile_simple_expr(parts[0])  # receiver: obj, call, literal…
                 self._emit(GET_ATTR, self._add_const(parts[1]))  # pop obj, push bound method
-                for child in node.children:
-                    self._compile_expr(child)
-                self._emit1(CALL, len(node.children))
             else:
                 self._compile_name(fn)
+            if not kwargs and not starred:
                 for child in node.children:
                     self._compile_expr(child)
                 self._emit1(CALL, len(node.children))
+                return
+            # Build an explicit arg list + kwargs dict so *args/**kwargs work.
+            self._emit(MAKE_LIST, 0)
+            kw_started = False
+            for child in node.children:
+                if child.type == "STAR":
+                    self._compile_expr(child.children[0])
+                    self._emit(LIST_EXTEND)
+                elif child.type == "DSTAR":
+                    if not kw_started:
+                        self._emit(MAKE_DICT, 0)
+                        kw_started = True
+                    self._compile_expr(child.children[0])
+                    self._emit(DICT_UPDATE)
+                elif child.type == "KWARG":
+                    if not kw_started:
+                        self._emit(MAKE_DICT, 0)
+                        kw_started = True
+                    self._emit(LOAD_CONST, self._add_const(str(child.value)))
+                    self._compile_expr(child.children[0])
+                    self._emit(DICT_SET)
+                else:
+                    self._compile_expr(child)
+                    self._emit(LIST_APPEND)
+            if not kw_started:
+                self._emit(MAKE_DICT, 0)
+            self._emit(CALL_EX)
 
     def _expr_LIST(self, node: ASTNode):
-        val = node.value
-        if val == "[]":
+        val = str(node.value or "")
+        inner = val[1:-1] if val.startswith("[") and val.endswith("]") else ""
+        if self._is_comprehension(inner):
+            self._compile_comprehension("list", inner)
+            return
+        if not inner.strip():
             self._emit(MAKE_LIST, 0)
             return
-        # Comprehensions arrive as verbatim text (`[x for x in xs]`). The VM
-        # has no comprehension opcodes; compiling the clause string as a
-        # simple expression used to fail with a confusing "undefined global
-        # `(p`". Raise a clear, actionable error instead.
-        if " for " in val or " if " in val:
-            raise SyntaxError(
-                "the bytecode VM does not support comprehensions yet — "
-                "run with the default backend (`externum run file.ext`), "
-                "or rewrite as an explicit loop"
-            )
-        # Parse items from string
-        items = self._parse_list_items(val[1:-1]) if val.startswith("[") else []
+        items = self._parse_list_items(inner)
+        self._emit(MAKE_LIST, 0)
         for item in items:
-            self._compile_simple_expr(item.strip())
-        self._emit(MAKE_LIST, len(items))
+            item = item.strip()
+            if not item:
+                continue
+            if item.startswith("*"):
+                self._compile_simple_expr(item[1:].strip())
+                self._emit(LIST_EXTEND)
+            else:
+                self._compile_simple_expr(item)
+                self._emit(LIST_APPEND)
 
     def _expr_DICT(self, node: ASTNode):
-        val = node.value
-        if val == "{}":
-            self._emit(MAKE_DICT, 0)
-            return
-        # Parse key-value pairs from string like '{"a": 1, "b": 2}'
+        val = str(node.value or "")
         inner = val[1:-1].strip() if val.startswith("{") and val.endswith("}") else val
+        if self._is_comprehension(inner):
+            self._compile_comprehension("dict", inner)
+            return
         if not inner:
             self._emit(MAKE_DICT, 0)
             return
-        pairs = self._parse_list_items(inner)
-        for pair in pairs:
-            if ":" in pair:
-                k, v = pair.split(":", 1)
-                self._compile_simple_expr(k.strip())
-                self._compile_simple_expr(v.strip())
-            else:
-                self._compile_simple_expr(pair.strip())
+        self._emit(MAKE_DICT, 0)
+        for pair in self._parse_list_items(inner):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if pair.startswith("**"):
+                self._compile_simple_expr(pair[2:].strip())
+                self._emit(DICT_UPDATE)
+                continue
+            k, v = self._split_top_level_colon(pair)
+            if v is None:
+                self._compile_simple_expr(k)
                 self._emit(LOAD_CONST, self._add_const(None))
-        self._emit(MAKE_DICT, len(pairs))
+            else:
+                self._compile_simple_expr(k)
+                self._compile_simple_expr(v)
+            self._emit(DICT_SET)
 
     def _expr_SET(self, node: ASTNode):
-        val = node.value
-        items = self._parse_list_items(val[1:-1]) if val.startswith("{") else []
+        val = str(node.value or "")
+        inner = val[1:-1] if val.startswith("{") and val.endswith("}") else ""
+        if self._is_comprehension(inner):
+            self._compile_comprehension("set", inner)
+            return
+        items = self._parse_list_items(inner) if inner.strip() else []
+        self._emit(MAKE_SET, 0)
         for item in items:
             self._compile_simple_expr(item.strip())
-        self._emit(MAKE_SET, len(items))
+            self._emit(SET_ADD)
+
+    # ── comprehensions ─────────────────────────────────────────────
+    def _pos(self) -> int:
+        return len(self._current_fn.bytecode if self._current_fn else self.module.bytecode)
+
+    def _top_level_keyword(self, text: str, keyword: str) -> "int | None":
+        """Index of a whitespace-delimited keyword at bracket/quote depth 0."""
+        depth = 0
+        quote = None
+        klen = len(keyword)
+        for i, ch in enumerate(text):
+            if quote:
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = None
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif depth == 0 and text.startswith(keyword, i):
+                before_ok = i == 0 or text[i - 1].isspace()
+                after = i + klen
+                after_ok = after >= len(text) or text[after].isspace()
+                if before_ok and after_ok:
+                    return i
+        return None
+
+    def _is_comprehension(self, text: str) -> bool:
+        return self._top_level_keyword(text, "for") is not None
+
+    def _split_top_level_colon(self, text: str) -> tuple[str, "str | None"]:
+        depth = 0
+        quote = None
+        for i, ch in enumerate(text):
+            if quote:
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = None
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif ch == ":" and depth == 0:
+                return text[:i].strip(), text[i + 1 :].strip()
+        return text.strip(), None
+
+    def _parse_comp_clauses(self, text: str) -> list[tuple[str, "str | None", str]]:
+        positions: list[tuple[int, str]] = []
+        for keyword in ("for", "if"):
+            start = 0
+            while True:
+                pos = self._top_level_keyword(text[start:], keyword)
+                if pos is None:
+                    break
+                positions.append((start + pos, keyword))
+                start += pos + len(keyword)
+        positions.sort()
+        clauses: list[tuple[str, str | None, str]] = []
+        for i, (pos, keyword) in enumerate(positions):
+            end = positions[i + 1][0] if i + 1 < len(positions) else len(text)
+            seg = text[pos + len(keyword) : end].strip()
+            if keyword == "for":
+                in_pos = self._top_level_keyword(seg, "in")
+                if in_pos is None:
+                    continue
+                clauses.append(("for", seg[:in_pos].strip(), seg[in_pos + 2 :].strip()))
+            else:
+                clauses.append(("if", None, seg))
+        return clauses
+
+    def _compile_comprehension(self, kind: str, text: str):
+        first = self._top_level_keyword(text, "for")
+        if first is None:
+            self._compile_simple_expr(text)
+            return
+        body_text = text[:first].strip()
+        clauses = self._parse_comp_clauses(text[first:])
+        acc = f"__comp{self._comp_counter}__"
+        self._comp_counter += 1
+        if kind == "list":
+            self._emit(MAKE_LIST, 0)
+        elif kind == "set":
+            self._emit(MAKE_SET, 0)
+        else:
+            self._emit(MAKE_DICT, 0)
+        self._store_var(acc)
+        self._comp_clause(kind, body_text, clauses, 0, acc)
+        self._compile_name(acc)
+
+    def _comp_clause(self, kind: str, body_text: str, clauses, idx: int, acc: str):
+        if idx >= len(clauses):
+            self._comp_accumulate(kind, body_text, acc)
+            return
+        ckind, var, payload = clauses[idx]
+        if ckind == "for":
+            self._compile_simple_expr(payload)
+            start = self._pos()
+            jump_out = self._emit_jump(FOR_ITER)
+            if "," in str(var):
+                names = [n.strip() for n in str(var).split(",") if n.strip()]
+                self._emit(UNPACK, len(names))
+                for name in reversed(names):
+                    self._store_var(name)
+            else:
+                self._store_var(str(var))
+            self._loop_stack.append([])
+            self._loop_start_stack.append(start)
+            self._comp_clause(kind, body_text, clauses, idx + 1, acc)
+            back = self._emit_jump(JUMP)
+            self._patch_jump_to(back, start)
+            self._patch_jump(jump_out)
+            self._loop_start_stack.pop()
+            for bp in self._loop_stack.pop():
+                self._patch_jump(bp)
+        else:
+            self._compile_simple_expr(payload)
+            skip = self._emit_jump(JUMP_IF_NOT)
+            self._comp_clause(kind, body_text, clauses, idx + 1, acc)
+            if self._loop_start_stack:
+                self._patch_jump_to(skip, self._loop_start_stack[-1])
+            else:
+                self._patch_jump(skip)
+
+    def _comp_accumulate(self, kind: str, body_text: str, acc: str):
+        if kind == "dict":
+            key, val = self._split_top_level_colon(body_text)
+            self._compile_name(acc)
+            self._compile_simple_expr(key)
+            self._compile_simple_expr(val if val is not None else "None")
+            self._emit(SET_INDEX)
+            return
+        self._compile_name(acc)
+        self._emit(GET_ATTR, self._add_const("append" if kind == "list" else "add"))
+        self._compile_simple_expr(body_text)
+        self._emit1(CALL, 1)
+        self._emit(POP)
 
     def _expr_TUPLE(self, node: ASTNode):
-        val = node.value
+        val = str(node.value or "")
         if val == "()":
             self._emit(MAKE_TUPLE, 0)
             return
-        items = self._parse_list_items(val[1:-1]) if val.startswith("(") else []
+        inner = val[1:-1] if val.startswith("(") else ""
+        items = self._parse_list_items(inner) if inner.strip() else []
+        if any(item.strip().startswith("*") for item in items):
+            self._emit(MAKE_LIST, 0)
+            for item in items:
+                item = item.strip()
+                if item.startswith("*"):
+                    self._compile_simple_expr(item[1:].strip())
+                    self._emit(LIST_EXTEND)
+                else:
+                    self._compile_simple_expr(item)
+                    self._emit(LIST_APPEND)
+            self._emit(LIST_TO_TUPLE)
+            return
         for item in items:
             self._compile_simple_expr(item.strip())
         self._emit(MAKE_TUPLE, len(items))
@@ -1226,17 +1689,9 @@ class BytecodeCompiler:
                 depth -= 1
         if bracket >= 0:
             obj_name = val[:bracket].strip()
-            # Compile the object - literal, dotted name or identifier
-            if not obj_name:
-                pass  # shouldn't happen for INDEX nodes
-            elif obj_name.startswith(("'", '"')):
-                self._emit(LOAD_CONST, self._add_const(_pyast.literal_eval(obj_name)))
-            elif "." in obj_name:
-                parts = obj_name.rsplit(".", 1)
-                self._compile_name(parts[0])
-                self._emit(GET_ATTR, self._add_const(parts[1]))
-            else:
-                self._compile_name(obj_name)
+            # The receiver can be a name, a call, a literal or a chain.
+            if obj_name:
+                self._compile_simple_expr(obj_name)
             # Compile the index expression
             idx_expr = val[bracket + 1 : -1].strip()
             # Slice support: a:b / a:b:c -> build via SLICE opcode with
@@ -1321,6 +1776,16 @@ class BytecodeCompiler:
             self._compile_expr(node.children[0])
 
     # ── helpers ─────────────────────────────────────────────────────
+    def _store_var(self, name: str):
+        """Pop the stack into `name`, choosing the global or local slot."""
+        if self._current_fn is None:
+            self._emit(STORE_GLOBAL, self._add_const(name))
+            self._declare_var(name)
+            return
+        self._declare_var(name)
+        kind, _ = self._resolve(name)
+        self._emit(STORE_VAR if kind != "global" else STORE_GLOBAL, self._add_const(name))
+
     def _compile_name(self, name: str):
         kind, _ = self._resolve(name)
         idx = self._add_const(name)
@@ -1377,6 +1842,47 @@ class BytecodeCompiler:
                 inner = expr[1:matched_end]
                 self._emit(LOAD_CONST, self._add_const(inner))
                 return
+        # list literal / comprehension
+        if expr.startswith("[") and expr.endswith("]"):
+            inner = expr[1:-1]
+            if self._is_comprehension(inner):
+                self._compile_comprehension("list", inner)
+                return
+            self._emit(MAKE_LIST, 0)
+            for item in self._parse_list_items(inner) if inner.strip() else []:
+                item = item.strip()
+                if not item:
+                    continue
+                if item.startswith("*"):
+                    self._compile_simple_expr(item[1:].strip())
+                    self._emit(LIST_EXTEND)
+                else:
+                    self._compile_simple_expr(item)
+                    self._emit(LIST_APPEND)
+            return
+        # dict / set literal
+        if expr.startswith("{") and expr.endswith("}"):
+            inner = expr[1:-1]
+            if self._is_comprehension(inner):
+                self._compile_comprehension("dict" if ":" in inner.split(" for ")[0] else "set", inner)
+                return
+            if ":" in inner:
+                self._emit(MAKE_DICT, 0)
+                for pair in self._parse_list_items(inner) if inner.strip() else []:
+                    k, v = self._split_top_level_colon(pair.strip())
+                    if v is None:
+                        self._compile_simple_expr(k)
+                        self._emit(LOAD_CONST, self._add_const(None))
+                    else:
+                        self._compile_simple_expr(k)
+                        self._compile_simple_expr(v)
+                    self._emit(DICT_SET)
+            else:
+                self._emit(MAKE_SET, 0)
+                for item in self._parse_list_items(inner) if inner.strip() else []:
+                    self._compile_simple_expr(item.strip())
+                    self._emit(SET_ADD)
+            return
         # True/False/None
         if expr == "True":
             self._emit(LOAD_CONST, self._add_const(True))
@@ -1401,7 +1907,8 @@ class BytecodeCompiler:
                     paren_idx = None  # Not a top-level function call
             if paren_idx is not None:
                 fn_name = expr[:paren_idx].strip()
-                if fn_name.isidentifier():
+                dotted_ok = "." in fn_name and all(p.isidentifier() for p in fn_name.split("."))
+                if fn_name.isidentifier() or dotted_ok:
                     args_str = expr[paren_idx + 1 : close_idx].strip()
                     args = self._parse_list_items(args_str) if args_str else []
                     builtin_map = {
@@ -1437,6 +1944,7 @@ class BytecodeCompiler:
                         "hash": 54,
                         "isinstance": 55,
                         "repr": 56,
+                        "super": 58,
                         "term_init": 60,
                         "term_cleanup": 61,
                         "term_clear": 62,
@@ -1458,11 +1966,31 @@ class BytecodeCompiler:
                             self._compile_simple_expr(a.strip())
                         self._emit2(INTRINSIC, builtin_map[fn_name], len(args))
                     else:
-                        self._compile_name(fn_name)
+                        if dotted_ok:
+                            receiver, attr = fn_name.rsplit(".", 1)
+                            self._compile_simple_expr(receiver)
+                            self._emit(GET_ATTR, self._add_const(attr))
+                        else:
+                            self._compile_name(fn_name)
                         for a in args:
                             self._compile_simple_expr(a.strip())
                         self._emit1(CALL, len(args))
                     return
+        # walrus: "n := expr"
+        walrus = self._split_top_level_walrus(expr)
+        if walrus is not None:
+            name, right = walrus
+            self._compile_simple_expr(right)
+            self._emit(DUP)
+            self._store_var(name)
+            return
+        # tuple literal: "1, 2" (top-level commas, no enclosing brackets)
+        if self._has_top_level_comma(expr):
+            items = self._parse_list_items(expr)
+            for item in items:
+                self._compile_simple_expr(item.strip())
+            self._emit(MAKE_TUPLE, len(items))
+            return
         # binary op: find LAST lowest-precedence operator outside parens
         split = self._find_top_level_binop(expr)
         if split is not None:
@@ -1490,16 +2018,55 @@ class BytecodeCompiler:
             self._compile_name(parts[0])
             self._emit(GET_ATTR, self._add_const(parts[1]))
             return
-        # indexing: a[i]
+        # indexing: a[i]  (receiver may itself be a call or a chain)
         if "[" in expr and expr.endswith("]"):
             inner = expr[: expr.rfind("[")]
             idx_expr = expr[expr.rfind("[") + 1 : -1]
-            self._compile_name(inner)
+            self._compile_simple_expr(inner)
             self._compile_simple_expr(idx_expr)
             self._emit(GET_INDEX)
             return
         # variable reference (fallback)
         self._compile_name(expr)
+
+    def _split_top_level_walrus(self, expr: str) -> "tuple[str, str] | None":
+        depth = 0
+        quote = None
+        for i, ch in enumerate(expr):
+            if quote:
+                if ch == quote and (i == 0 or expr[i - 1] != "\\"):
+                    quote = None
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif depth == 0 and expr.startswith(":=", i):
+                name = expr[:i].strip()
+                if name.isidentifier():
+                    return name, expr[i + 2 :].strip()
+                return None
+        return None
+
+    def _has_top_level_comma(self, expr: str) -> bool:
+        depth = 0
+        quote = None
+        for i, ch in enumerate(expr):
+            if quote:
+                if ch == quote and (i == 0 or expr[i - 1] != "\\"):
+                    quote = None
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                return True
+        return False
 
     def _find_top_level_paren(self, expr: str) -> "int | None":
         """Find the position of the first top-level '(' in the expression."""

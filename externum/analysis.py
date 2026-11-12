@@ -17,6 +17,12 @@ import re
 from .parser import ASTNode
 from .typesys import ExternumTypeError, TypeChecker
 
+# `comptime` declarations are evaluated once at load time by the transpiler.
+# There is no separate compile-time interpreter here, so the keyword is
+# dropped and the declaration executes at module scope — same observable
+# value, no runtime cost difference for constants.
+_COMPTIME = re.compile(r"(?m)^([ \t]*)comptime[ \t]+")
+
 _MACRO_DEF = re.compile(
     r"macro\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(([^)]*)\))?\s*\{([\s\S]*?)\}",
     re.MULTILINE,
@@ -32,7 +38,8 @@ def _split_args(raw: str) -> list[str]:
 
 
 def preprocess(source: str) -> tuple[str, dict]:
-    """Expand macro definitions. Returns (processed_source, macros)."""
+    """Expand macro definitions and strip `comptime`. Returns (source, macros)."""
+    source = _COMPTIME.sub(r"\1", source)
     macros = {}
     for m in _MACRO_DEF.finditer(source):
         name, params, body = m.group(1), m.group(2), m.group(3)

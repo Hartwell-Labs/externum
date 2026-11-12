@@ -2,6 +2,80 @@
 
 All notable changes to Externum will be documented in this file.
 
+## [4.4.0] - 2026-11-12 — "Titan"
+
+Language and VM parity release: the bytecode VM (the default `externum run`
+backend) now implements the features that previously only worked through the
+Python transpiler, and a batch of long-standing defects is fixed in both.
+The same program now prints byte-identical output on `--backend vm` and
+`--backend python`.
+
+### Added
+- **Comprehensions on the VM** — list, set and dict comprehensions with
+  filters, nested `for` clauses and tuple targets; the old
+  "the bytecode VM does not support comprehensions yet" error is gone.
+- **Class inheritance + `super()` on the VM** — base classes are linked at
+  `MAKE_CLASS`, method lookup walks the MRO depth-first, and `super()`
+  resolves through a new `ExternumSuper` proxy.
+- **`with ... as` on the VM** — binds each context and closes it on exit.
+- **Enums as values and constructors** — `Color.RED` is a value, `Color.RED(x)`
+  constructs a payload variant; equality, hashing and `repr` are defined.
+  The Python backend generates the same shape.
+- **Generators on the VM** — `yield`, `yield from` and `for` over generator
+  functions work; `yield from` is desugared by the parser for both backends.
+- **Walrus operator `:=`** — lexer, parser and both backends.
+- **Star unpacking everywhere** — `f(*args)`, `f(**kwargs)`, `[*xs]`, `(*xs,)`
+  via new `CALL_EX`, `LIST_APPEND/EXTEND`, `SET_ADD`, `DICT_SET/UPDATE` and
+  `LIST_TO_TUPLE` opcodes.
+- **Function-level `defer`** — real `try/finally` in the Python backend and
+  deferred execution on every `return`/`break`/`continue` in the VM.
+- **`comptime` declarations** — accepted by the transpiler (evaluated at load).
+- **`Ok`/`Err`/`Some` and type names** (`Int`, `Str`, `List`, `Dict`,
+  `Optional`, `Union`, ...) in the runtime globals, plus union and generic
+  annotations (`Int | None`, `def f[T](x: T)`).
+- **f-string format specs and conversions** on the VM (`f"{x:.2f}"`, `{x!r}`),
+  triple-quoted strings, and `print(sep=..., end=...)` keyword arguments.
+- **`except ... as e` binding, exception-type filters and `finally`** on the
+  VM (exceptions are now passed as objects, not strings).
+- **`del obj[i]`, `del obj.attr`, `del name`** on the VM.
+- 33 new regression tests in `tests/test_v440_features.py` (452 total).
+
+### Fixed
+- **Index assignment on the VM** wrote into the wrong slot (`d["k"] = 1`
+  produced `{1: "k"}`); `SET_INDEX` now receives `(obj, index, value)`.
+- **`d[k] += v`** on the VM (double `SWAP` left the stack in the wrong order).
+- **Tuple assignment `a, b = 1, 2`** on the VM (RHS was compiled as a name).
+- **`match` with alternation** (`case "a" | "b"`) on the VM.
+- **`not in` / `is not`** were split into unary `not` + unknown token; both
+  backends emit the correct operator now.
+- **Method calls on a list literal** (`[].count(1)`) — the parser dropped the
+  postfix chain after a list literal.
+- **Struct fields** — the VM used synthetic `field0..fieldN` names instead of
+  the declared ones; structs also accept keyword arguments and pre-fill
+  missing fields with `None`.
+- **`try/finally` with `return` on the VM** — the `finally` block now runs on
+  early exits.
+- **`print("a", end="")`** printed an extra space/newline on the VM.
+- **Macros were not expanded on the VM** (`VM.run_source` skipped
+  `preprocess`), so `macro SQUARE(x)` failed with `undefined global SQUARE`.
+- **String escapes** (`"\n"`) stayed literal on the VM; literals are now
+  decoded with `ast.literal_eval` (also covers raw/triple-quoted strings).
+- **Index/call receivers** (`c.most_common()[0]`, `[].count(1)`) compiled the
+  whole receiver text as a name; receivers now go through the expression
+  compiler.
+- **`@p = value` deref stores** had the pointer and value swapped on the VM.
+- **`match` binding patterns and guards** (`case n if n > 1:`) on the VM —
+  only literals were matched before. Destructuring (`case [a, b]:`) works too.
+- **`sorted`/`min`/`max` `key=`** were dropped on the VM; lambdas are now
+  callable from host code (`EXTERNUMClosure.__call__`).
+- **Class attribute access** (`Pokemon.__init__`) returned Python's
+  `ExternumClass.__init__` instead of the Externum method.
+- **Type names in the VM globals** (`Int`, `Str`, `List`, ...) so
+  `alloc(Int)` and annotations resolve.
+- **`examples/hardcore.ext` and `examples/pokedex.ext` now produce identical
+  output on both backends** (regression tests added). `examples/hello.ext`
+  still differs by design: the VM does not execute inline Bash blocks.
+
 ## [4.3.1] - 2026-09-25
 
 ### Changed

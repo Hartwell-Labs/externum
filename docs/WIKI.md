@@ -183,7 +183,7 @@ source (.ext) → Lexer → tokens → Parser → AST → Compiler → python/ba
 
 ## Tests
 
-`python3 -m unittest discover -s tests` — **366 tests** covering lexer,
+`python3 -m unittest discover -s tests` — **452 tests** covering lexer,
 parser, compiler and runtime (classes, exceptions, imports, lambdas,
 comprehensions, generators, stdlib, REPL), plus the suites:
 `tests/test_drm.py` (license keys, watermark, tamper-detection,
@@ -223,6 +223,29 @@ p: Ptr[Int] = alloc(Int)
 print(@p)     # 42
 free(p)       # double-free or @p after this line = compile error
 ```
+
+## VM parity (v4.4)
+
+The bytecode VM (`externum run file.ext --backend vm`) implements the same
+surface language as the Python transpiler. Since v4.4 both backends produce
+byte-identical output for `examples/hardcore.ext` and `examples/pokedex.ext`:
+
+- **Comprehensions** — list, set and dict, with `if` filters, nested `for`
+  clauses and `for k, v in ...` targets.
+- **Classes** — inheritance with depth-first method resolution and `super()`.
+- **Exceptions** — `try/except Type as e/else/finally`; handlers filter on the
+  exception type, `finally` also runs on `return`/`break`/`continue`.
+- **`with ... as`** — binds the context and calls `close()` on exit.
+- **Generators** — `yield`, `yield from` and iteration with `for`.
+- **Enums** — variants are values *and* constructors: `Color.RED`,
+  `Color.RED(payload)`; equality, hashing and `repr` are defined.
+- **Packing** — `*args`, `**kwargs`, `[*xs]`, `(*xs,)`, `a, b = 1, 2`.
+- **Strings** — f-string format specs (`{x:.2f}`), conversions (`{x!r}`),
+  triple-quoted strings, `print(sep=, end=)`.
+- **`defer`** — runs on every exit path of a function.
+
+Anywhere the two still differ is tracked in `CHANGELOG.md`; the VM is the
+default backend for `externum run`.
 
 ## DRM (`externum compile --protect`)
 

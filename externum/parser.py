@@ -84,7 +84,10 @@ KNOWN_TYPES = {"Int", "Float", "Str", "Bool", "Void", "Any", "Ptr", "List", "Dic
 
 # Strip type annotations from parameter lists: `n: Int` -> `n`,
 # `xs: List[Int]` -> `xs` (tolerates spaces around the brackets).
-_PARAM_ANNOTATION = re.compile(r":\s*[A-Za-z_][A-Za-z0-9_]*\s*(\[\s*[^\]]*\s*\])?")
+_PARAM_ANNOTATION = re.compile(
+    r":\s*[A-Za-z_][A-Za-z0-9_]*\s*(?:\[\s*[^\]]*\s*\])?"
+    r"(?:\s*\|\s*[A-Za-z_][A-Za-z0-9_]*\s*(?:\[\s*[^\]]*\s*\])?)*"
+)
 
 # Highest binary precedence (used for unary prefix operands).
 _UNARY_BIND = 10
@@ -186,6 +189,18 @@ class Parser:
             return node
         if t == "YIELD":
             self.pos += 1
+            if self.pos < len(self.tokens) and self.tokens[self.pos].type == "FROM":
+                self.pos += 1
+                # `yield from xs` → `for __yf in xs: yield __yf` (both backends)
+                iterable = self._parse_expression()
+                return ASTNode(
+                    "FOR",
+                    value="__yield_from",
+                    children=[
+                        ASTNode("ITERABLE", children=[iterable]),
+                        ASTNode("YIELD", children=[ASTNode("IDENTIFIER", value="__yield_from")]),
+                    ],
+                )
             node = ASTNode("YIELD")
             if self.pos < len(self.tokens) and self.tokens[self.pos].type != "NEWLINE":
                 node.children.append(self._parse_expression())
@@ -305,6 +320,19 @@ class Parser:
         self.pos += 1  # DEF
         name = self.tokens[self.pos].value
         self.pos += 1
+        # Generic parameters: `def map[T](xs: List[T]) -> List[T]` — the VM
+        # and transpiler are dynamically typed, so [T] only documents intent.
+        if self.pos < len(self.tokens) and self.tokens[self.pos].type == "LBRACKET":
+            depth = 0
+            while self.pos < len(self.tokens):
+                if self.tokens[self.pos].type == "LBRACKET":
+                    depth += 1
+                elif self.tokens[self.pos].type == "RBRACKET":
+                    depth -= 1
+                    if depth == 0:
+                        self.pos += 1
+                        break
+                self.pos += 1
         params = ""
         param_types = []
         if self.pos < len(self.tokens) and self.tokens[self.pos].type == "LPAREN":
@@ -775,8 +803,10 @@ class Parser:
         return ASTNode("LOOP", children=body)
 
     def _parse_defer_stmt(self) -> ASTNode:
-        """defer: body — execute at scope exit."""
+        """defer: body — execute at scope exit (also accepts `defer stmt`)."""
         self.pos += 1  # DEFER
+        if self.pos < len(self.tokens) and self.tokens[self.pos].type not in ("COLON", "NEWLINE"):
+            return ASTNode("DEFER", children=[self._parse_statement_inner()])
         self._skip_to_colon()
         body = self._parse_block()
         return ASTNode("DEFER", children=body)
@@ -893,6 +923,41 @@ class Parser:
         left = self._parse_unary()
         while self.pos < len(self.tokens):
             tok = self.tokens[self.pos]
+            # Compound comparison operators: `x not in y` / `x is not y`.
+            if tok.type == "NOT" and self.pos + 1 < len(self.tokens) and self.tokens[self.pos + 1].type == "IN":
+                prec = _PRECEDENCE.get("in", 4)
+                if prec < min_prec:
+                    break
+                self.pos += 2
+                right = self._parse_expression(prec + 1)
+                left = ASTNode(
+                    "BINOP",
+                    value=f"{self._node_to_str(left)} not in {self._node_to_str(right)}",
+                    children=[left, ASTNode("OP", value="not in"), right],
+                )
+                continue
+            if tok.type == "IS" and self.pos + 1 < len(self.tokens) and self.tokens[self.pos + 1].type == "NOT":
+                prec = _PRECEDENCE.get("is", 4)
+                if prec < min_prec:
+                    break
+                self.pos += 2
+                right = self._parse_expression(prec + 1)
+                left = ASTNode(
+                    "BINOP",
+                    value=f"{self._node_to_str(left)} is not {self._node_to_str(right)}",
+                    children=[left, ASTNode("OP", value="is not"), right],
+                )
+                continue
+            # Walrus: `(n := expr)` — bind and yield the value.
+            if tok.type == ":=":
+                self.pos += 1
+                right = self._parse_expression(1)
+                left = ASTNode(
+                    "WALRUS",
+                    value=f"{self._node_to_str(left)} := {self._node_to_str(right)}",
+                    children=[left, right],
+                )
+                continue
             op_type = _OP_TYPES.get(tok.type, tok.type)
             prec = _PRECEDENCE.get(op_type)
             if prec is None or prec < min_prec:
@@ -1115,23 +1180,27 @@ class Parser:
         self._skip_newlines()
         if self.pos < len(self.tokens) and self.tokens[self.pos].type == "RBRACKET":
             self.pos += 1
-            return ASTNode("LIST", value="[]")
+            return self._parse_postfix(ASTNode("LIST", value="[]"))
         first = self._parse_expression()
         self._skip_newlines()
         if self.pos < len(self.tokens) and self.tokens[self.pos].type in ("FOR", "IF"):
             comp = self._parse_comprehension_clauses(first)
             self._expect("RBRACKET")
-            return ASTNode("LIST", value=f"[{comp}]")
+            return self._parse_postfix(ASTNode("LIST", value=f"[{comp}]"))
         items = [self._node_to_str(first)]
         while self.pos < len(self.tokens) and self.tokens[self.pos].type == "COMMA":
             self.pos += 1
             self._skip_newlines()
             if self.pos < len(self.tokens) and self.tokens[self.pos].type == "RBRACKET":
                 break
-            items.append(self._node_to_str(self._parse_expression()))
+            if self.pos < len(self.tokens) and self.tokens[self.pos].type == "TIMES":
+                self.pos += 1
+                items.append("*" + self._node_to_str(self._parse_expression()))
+            else:
+                items.append(self._node_to_str(self._parse_expression()))
             self._skip_newlines()
         self._expect("RBRACKET")
-        return ASTNode("LIST", value=f"[{', '.join(items)}]")
+        return self._parse_postfix(ASTNode("LIST", value=f"[{', '.join(items)}]"))
 
     def _parse_dict_or_set(self) -> ASTNode:
         self.pos += 1  # LBRACE
@@ -1162,6 +1231,12 @@ class Parser:
                 pairs.append(f"{self._node_to_str(k)}: {self._node_to_str(v)}")
             self._expect("RBRACE")
             return ASTNode("DICT", value=f"{{{', '.join(pairs)}}}")
+        if self.pos < len(self.tokens) and self.tokens[self.pos].type in ("FOR", "IF"):
+            # set comprehension: {expr for x in xs if cond}
+            comp = self._parse_comprehension_clauses(first)
+            self._skip_newlines()
+            self._expect("RBRACE")
+            return ASTNode("SET", value=f"{{{comp}}}")
         items = [self._node_to_str(first)]
         self._skip_newlines()
         while self.pos < len(self.tokens) and self.tokens[self.pos].type == "COMMA":
@@ -1182,9 +1257,18 @@ class Parser:
                 tok = self.tokens[self.pos]
                 if tok.type == "FOR":
                     self.pos += 1
-                    var = self.tokens[self.pos].value
-                    self.pos += 1
-                    self._expect_token("IN")
+                    # Target may be a tuple: `for k, v in items`
+                    var_parts = []
+                    while self.pos < len(self.tokens) and self.tokens[self.pos].type not in ("IN", "NEWLINE"):
+                        item_tok = self.tokens[self.pos]
+                        if item_tok.type == "COMMA":
+                            var_parts.append(",")
+                        elif item_tok.type not in ("LPAREN", "RPAREN", "LBRACKET", "RBRACKET"):
+                            var_parts.append(str(item_tok.value))
+                        self.pos += 1
+                    var = " ".join(var_parts).replace(" ,", ",").strip()
+                    if self.pos < len(self.tokens) and self.tokens[self.pos].type == "IN":
+                        self.pos += 1
                     it = self._parse_expression()
                     parts.append(f"for {var} in {self._node_to_str(it)}")
                 elif tok.type == "IF":
