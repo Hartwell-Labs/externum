@@ -916,9 +916,7 @@ class BytecodeCompiler:
             skip = None
             bindings: list[str] = []
 
-            enum_pat = re.match(
-                r"^([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:\((.*)\))?$", pat, re.DOTALL
-            )
+            enum_pat = re.match(r"^([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:\((.*)\))?$", pat, re.DOTALL)
             if pat in ("_", ""):
                 pass  # wildcard: always matches
             elif enum_pat:

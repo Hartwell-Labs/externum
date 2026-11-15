@@ -741,17 +741,14 @@ class VM:
             if vararg:
                 local_vars[vararg] = list(args[len(fn.arg_names) :])
             if kwarg:
-                local_vars[kwarg] = {
-                    k: v for k, v in (kwargs or {}).items() if k not in fn.arg_names
-                }
+                local_vars[kwarg] = {k: v for k, v in (kwargs or {}).items() if k not in fn.arg_names}
             else:
                 local_vars.update(kwargs or {})
             return self._execute(
                 fn.bytecode,
                 fn.constants,
                 local_vars,
-                all_fns
-                or (self._modules[list(self._modules.keys())[0]].functions if self._modules else []),
+                all_fns or (self._modules[list(self._modules.keys())[0]].functions if self._modules else []),
                 fn_name=fn.name,
                 fn_obj=fn_obj or fn,
                 yield_sink=yield_sink,
@@ -870,9 +867,7 @@ class VM:
                     all_fns=fn.all_fns,
                 )
                 return iter(sink)
-            return self.run_function(
-                fn.fn, list(args), kwargs=kwargs, upvalues=fn.upvalues, all_fns=fn.all_fns
-            )
+            return self.run_function(fn.fn, list(args), kwargs=kwargs, upvalues=fn.upvalues, all_fns=fn.all_fns)
         if isinstance(fn, BytecodeFunction):
             if getattr(fn, "is_generator", False):
                 sink = []
