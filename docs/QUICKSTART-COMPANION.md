@@ -69,6 +69,6 @@ git clone https://github.com/BartoszOsiej/externum && cd externum && pip install
 
 ```bash
 docker run --rm -v "$(pwd)":/src -w /src \
-  ghcr.io/bartoszosiej/externum:latest \
+  ghcr.io/hartwell-labs/externum-lang:latest \
   bash -c "externum compile --target python hello.ext -o /src/hello.py && externum compile --target bash hello.ext -o /src/hello.sh && externum compile --target native hello.ext -o /src/hello"
 ```
