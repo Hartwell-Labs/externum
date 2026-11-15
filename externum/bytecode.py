@@ -423,7 +423,7 @@ class BytecodeCompiler:
                 attr_idx = self._add_const(parts[1])
                 self._emit(SET_ATTR, attr_idx)
         elif target.type == "INDEX":
-            # Unparseable index target: drop the already-pushed value instead
+            # Unparsable index target: drop the already-pushed value instead
             # of leaving the stack unbalanced.
             self._emit(POP)
         elif target.type == "DEREF":

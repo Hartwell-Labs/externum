@@ -260,7 +260,7 @@ class ExternumOption(ExternumObject):
 class ExternumClosure(ExternumObject):
     """A closure wrapping a function with captured upvalues."""
 
-    __slots__ = ("_fn", "_upvalues", "_vm", "_all_fns")
+    __slots__ = ("_all_fns", "_fn", "_upvalues", "_vm")
 
     def __init__(self, fn: BytecodeFunction, upvalues: dict, vm=None, all_fns=None):
         object.__setattr__(self, "_fn", fn)
@@ -1461,7 +1461,9 @@ class VM:
                         self._stdout.flush()
                     except Exception:
                         pass
-                    subprocess.run(code, shell=True)
+                    # Externum's Bash blocks are an intentional language
+                    # feature; the command is authored source, not user input.
+                    subprocess.run(code, shell=True)  # noqa: S602  # nosec B602
                 elif op == PANIC:
                     msg = stack.pop() if stack else "panic"
                     raise ExternumError(f"panic: {msg}")
