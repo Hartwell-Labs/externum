@@ -7,17 +7,20 @@ permissions: read-all
 
 jobs:
   diagnose:
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-latest
     steps:
-      - name: Login with BOT_TOKEN
+      - name: Login with GITHUB_TOKEN
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.BOT_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Probe fresh package
         run: |
           docker pull alpine:3.20
-          docker tag alpine:3.20 ghcr.io/hartwell-labs/externum-probe:bot
-          docker push ghcr.io/hartwell-labs/externum-probe:bot
+          docker tag alpine:3.20 ghcr.io/hartwell-labs/externum-probe:token
+          docker push ghcr.io/hartwell-labs/externum-probe:token
