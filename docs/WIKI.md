@@ -1,4 +1,4 @@
-# Externum Language — Specification (v3.0)
+# Externum Language — Specification (v4.4.1 "Titan")
 
 ## Introduction
 
@@ -21,7 +21,7 @@ pure Python 3.10+ with zero external dependencies.
 | Parser | `externum/parser.py` | Full grammar → AST |
 | Compiler | `externum/compiler.py` | Codegen → Python / Bash / binary |
 | Type checker | `externum/typesys.py` | Hard-mode static types + ownership analysis |
-| Hard mode | `externum/hardmode.py` | Macros, mandatory-declaration pipeline |
+| Analysis | `externum/analysis.py` | Macro/comptime expansion and the strict pipeline |
 | DRM | `externum/drm.py` | License keys, watermark, tamper-detection, obfuscation |
 | Runtime | `externum/runtime/` | Execution, `.ext` module loader, REPL, memory/concurrency helpers (`rtlib.py`) |
 | CLI | `externum/__main__.py` | `run`, `repl`, `compile`, `keygen` |
@@ -155,7 +155,7 @@ externum run program.ext [args...]   # execute
 externum repl                        # interactive shell
 externum program.ext --target python|bash|binary|all
 externum program.ext -o out.py
-externum --version                   # Externum 3.0.0
+externum --version                   # Externum 4.4.1
 
 # hard mode
 externum run program.ext --hard
@@ -224,11 +224,12 @@ print(@p)     # 42
 free(p)       # double-free or @p after this line = compile error
 ```
 
-## VM parity (v4.4)
+## VM parity (v4.4.1)
 
 The bytecode VM (`externum run file.ext --backend vm`) implements the same
-surface language as the Python transpiler. Since v4.4 both backends produce
-byte-identical output for `examples/hardcore.ext` and `examples/pokedex.ext`:
+surface language as the Python transpiler. Since v4.4.1 both backends produce
+byte-identical output for `examples/hardcore.ext`, `examples/pokedex.ext` and
+the full-surface `examples/titan_tour.ext`:
 
 - **Comprehensions** — list, set and dict, with `if` filters, nested `for`
   clauses and `for k, v in ...` targets.
@@ -238,7 +239,12 @@ byte-identical output for `examples/hardcore.ext` and `examples/pokedex.ext`:
 - **`with ... as`** — binds the context and calls `close()` on exit.
 - **Generators** — `yield`, `yield from` and iteration with `for`.
 - **Enums** — variants are values *and* constructors: `Color.RED`,
-  `Color.RED(payload)`; equality, hashing and `repr` are defined.
+  `Color.RED(payload)`; equality, hashing and `repr` are defined; constructor
+  patterns such as `case Shape.Circle(r)` bind the payload and support guards.
+- **Imports** — sibling `.ext` modules resolve relative to the script, are
+  compiled to EXBC and run on the VM in their own namespace, and
+  `compile --target bytecode` bundles locally resolvable modules into `.exbc`.
+- **Bash** — inline `` `cmd` `` and `%% ... %%` blocks execute on both backends.
 - **Packing** — `*args`, `**kwargs`, `[*xs]`, `(*xs,)`, `a, b = 1, 2`.
 - **Strings** — f-string format specs (`{x:.2f}`), conversions (`{x!r}`),
   triple-quoted strings, `print(sep=, end=)`.

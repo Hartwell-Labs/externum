@@ -396,7 +396,8 @@ class Parser:
 
     def _parse_case_pattern(self) -> str:
         """Parse a case pattern: literal, ident (bind), `_` wildcard,
-        list destructure `[a, b]`, or a tuple `(a, b)`."""
+        list destructure `[a, b]`, tuple `(a, b)`, or an enum constructor
+        such as `Shape.Circle(r)` / `Some(value)`."""
         tok = self.tokens[self.pos]
         if tok.type == "LBRACKET":
             self.pos += 1
@@ -434,7 +435,26 @@ class Parser:
             return f"-{val.value}"
         if tok.type in ("IDENTIFIER", "BUILTIN"):
             self.pos += 1
-            return tok.value  # bind name or `_` wildcard
+            name = tok.value  # bind name or `_` wildcard
+            # Qualified enum pattern: `Shape.Circle(r)`, `Color.RED`.
+            while self.pos < len(self.tokens) and self.tokens[self.pos].type == "DOT":
+                self.pos += 1
+                if self.pos >= len(self.tokens) or self.tokens[self.pos].type not in ("IDENTIFIER", "BUILTIN"):
+                    return name
+                name += "." + self.tokens[self.pos].value
+                self.pos += 1
+            # Constructor payload: `Some(x)` or `Shape.Circle(r)`.
+            if self.pos < len(self.tokens) and self.tokens[self.pos].type == "LPAREN":
+                self.pos += 1
+                items = []
+                while self.pos < len(self.tokens) and self.tokens[self.pos].type != "RPAREN":
+                    if self.tokens[self.pos].type == "COMMA":
+                        self.pos += 1
+                        continue
+                    items.append(self._parse_case_pattern())
+                self._expect("RPAREN")
+                return name + "(" + ", ".join(items) + ")"
+            return name
         self.pos += 1
         return tok.value
 

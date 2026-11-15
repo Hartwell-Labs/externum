@@ -30,6 +30,7 @@ from .bytecode import (
     AND,
     ASSERT_EQ,
     AWAIT_OP,
+    BASH_EXEC,
     BITAND,
     BITNOT,
     BITOR,
@@ -164,6 +165,10 @@ class ExternumEnum(ExternumObject):
         object.__setattr__(self, "__data", data)
 
     @property
+    def typename(self):
+        return object.__getattribute__(self, "__typename")
+
+    @property
     def variant(self):
         return object.__getattribute__(self, "__variant")
 
@@ -255,12 +260,13 @@ class ExternumOption(ExternumObject):
 class ExternumClosure(ExternumObject):
     """A closure wrapping a function with captured upvalues."""
 
-    __slots__ = ("_fn", "_upvalues", "_vm")
+    __slots__ = ("_fn", "_upvalues", "_vm", "_all_fns")
 
-    def __init__(self, fn: BytecodeFunction, upvalues: dict, vm=None):
+    def __init__(self, fn: BytecodeFunction, upvalues: dict, vm=None, all_fns=None):
         object.__setattr__(self, "_fn", fn)
         object.__setattr__(self, "_upvalues", upvalues)
         object.__setattr__(self, "_vm", vm)
+        object.__setattr__(self, "_all_fns", all_fns)
 
     def __call__(self, *args, **kwargs):
         """Let host code (sorted/min/max `key=`) call an Externum lambda."""
@@ -276,6 +282,10 @@ class ExternumClosure(ExternumObject):
     @property
     def upvalues(self):
         return object.__getattribute__(self, "_upvalues")
+
+    @property
+    def all_fns(self):
+        return object.__getattribute__(self, "_all_fns")
 
 
 class ExternumBoundMethod(ExternumObject):
@@ -323,7 +333,11 @@ class ExternumSuper(ExternumObject):
     def __init__(self, instance):
         object.__setattr__(self, "_instance", instance)
 
-    def __getattr__(self, name):
+    def __getattribute__(self, name):
+        # Dunder methods such as `__init__` resolve on ExternumSuper itself
+        # under normal attribute lookup, so intercept them here as well.
+        if name == "_instance":
+            return object.__getattribute__(self, name)
         inst = object.__getattribute__(self, "_instance")
         if inst is None:
             raise AttributeError("super() used outside a method")
@@ -335,7 +349,7 @@ class ExternumSuper(ExternumObject):
                     if isinstance(found, ExternumClosure):
                         return ExternumBoundMethod(inst, found)
                     return found
-        raise AttributeError(f"super object has no attribute '{name}'")
+        return object.__getattribute__(self, name)
 
 
 class ExternumInstance:
@@ -453,7 +467,7 @@ class _ReturnSignal(Exception):
 class VM:
     """Stack-based virtual machine for EXBC bytecode."""
 
-    def __init__(self, stdout=None, stderr=None, argv=None):
+    def __init__(self, stdout=None, stderr=None, argv=None, search_roots=None):
         self._stack: list[Any] = []
         self._globals: dict[str, Any] = {}
         self._heap = ExternumHeap()
@@ -461,6 +475,12 @@ class VM:
         self._stderr = stderr or sys.stderr
         self._argv = argv or []
         self._modules: dict[str, BytecodeModule] = {}
+        self._module_namespaces: dict[str, dict] = {}
+        self._capture_closures: list | None = None
+        # Directories searched for local `.ext` imports, nearest first.
+        # The CLI seeds this with the script/artifact directory.
+        self._search_roots: list[str] = [str(p) for p in (search_roots or [])]
+        self._embedded_sources: dict[str, str] = {}
         self._defer_stack: list[list] = []
         self._channels: dict[int, queue.Queue] = {}
         # Instance currently executing a bound method (for `super()`).
@@ -625,6 +645,7 @@ class VM:
     # ── main entry ────────────────────────────────────────────────
     def run_module(self, module: BytecodeModule) -> Any:
         self._modules[module.name] = module
+        self._embedded_sources.update(getattr(module, "embedded_sources", {}) or {})
         self._current_module = module
         self._current_fn = None
         self._defer_stack.append([])
@@ -644,6 +665,51 @@ class VM:
     #: set by _execute when the top-level bytecode actually references main
     _main_was_called: bool = False
 
+    def _execute_imported_module(self, module: BytecodeModule) -> dict:
+        """Execute an imported module in its own namespace on the VM.
+
+        The module's top-level names must not leak into the importer, but its
+        functions must still see them when called later. We therefore run the
+        module against a fresh globals mapping and then attach a snapshot of
+        that mapping as upvalues to every closure it created.
+        """
+        saved_globals = self._globals
+        saved_module = self._current_module
+        saved_fn = self._current_fn
+        saved_capture = self._capture_closures
+        saved_main_called = self._main_was_called
+
+        self._globals = {k: v for k, v in saved_globals.items() if k in self._builtin_keys}
+        self._current_module = module
+        self._current_fn = None
+        self._capture_closures = []
+        self._main_was_called = False
+        self._defer_stack.append([])
+        try:
+            self._execute(module.bytecode, module.constants, {}, module.functions)
+        finally:
+            try:
+                self._run_deferred(self._defer_stack.pop())
+            finally:
+                namespace = dict(self._globals)
+                closures = self._capture_closures or []
+                self._globals = saved_globals
+                self._current_module = saved_module
+                self._current_fn = saved_fn
+                self._capture_closures = saved_capture
+                self._main_was_called = saved_main_called
+
+        # Functions defined by the module resolve their module globals through
+        # closure upvalues when they are called from the importer.
+        for closure in closures:
+            merged = dict(closure.upvalues)
+            merged.update(namespace)
+            object.__setattr__(closure, "_upvalues", merged)
+
+        self._modules[module.name] = module
+        self._module_namespaces[module.name] = namespace
+        return namespace
+
     def run_function(
         self,
         fn: BytecodeFunction,
@@ -652,6 +718,7 @@ class VM:
         upvalues: dict = None,
         fn_obj: "BytecodeFunction | None" = None,
         yield_sink: list = None,
+        all_fns: list | None = None,
     ) -> Any:
         # Save and restore the stack to avoid corruption during nested calls
         saved_stack = self._stack
@@ -669,12 +736,22 @@ class VM:
             # Set provided args
             for name, val in zip(fn.arg_names, args):
                 local_vars[name] = val
-            local_vars.update(kwargs or {})
+            vararg = getattr(fn, "vararg", None)
+            kwarg = getattr(fn, "kwarg", None)
+            if vararg:
+                local_vars[vararg] = list(args[len(fn.arg_names) :])
+            if kwarg:
+                local_vars[kwarg] = {
+                    k: v for k, v in (kwargs or {}).items() if k not in fn.arg_names
+                }
+            else:
+                local_vars.update(kwargs or {})
             return self._execute(
                 fn.bytecode,
                 fn.constants,
                 local_vars,
-                self._modules[list(self._modules.keys())[0]].functions if self._modules else [],
+                all_fns
+                or (self._modules[list(self._modules.keys())[0]].functions if self._modules else []),
                 fn_name=fn.name,
                 fn_obj=fn_obj or fn,
                 yield_sink=yield_sink,
@@ -706,33 +783,60 @@ class VM:
         return self.run_module(module)
 
     def _vm_import(self, name: str):
-        """Import an Externum module by name, finding .ext files in lib/ etc."""
+        """Import an Externum module by name and run it on the VM."""
         import os
 
-        if name in self._modules:
-            mod = self._modules[name]
-            return type("Module", (), dict(mod.globals))()
-        # Search for .ext file
+        if name in self._module_namespaces:
+            ns = self._module_namespaces[name]
+            mod_obj = type("Module", (), {})()
+            mod_obj.__dict__.update(ns)
+            return mod_obj
+
+        def _module_obj(ns):
+            # Build an empty object and copy the namespace in. Passing the
+            # namespace as class-body dict would make a leaked `__init__`
+            # method from an imported class run as the module's constructor.
+            mod_obj = type("Module", (), {})()
+            mod_obj.__dict__.update(ns)
+            return mod_obj
+
+        def _run_ext_source(source, module_name, module_dir=None):
+            from .analysis import preprocess
+            from .bytecode import BytecodeCompiler
+            from .lexer import Lexer
+            from .parser import Parser
+
+            source, _ = preprocess(source)
+            ast = list(Parser(Lexer(source).tokenize()).parse())
+            module = BytecodeCompiler(ast, module_name=module_name).compile()
+            saved_roots = list(self._search_roots)
+            if module_dir:
+                self._search_roots.insert(0, module_dir)
+            try:
+                ns = self._execute_imported_module(module)
+            finally:
+                self._search_roots = saved_roots
+            return _module_obj(ns)
+
+        if name in self._embedded_sources:
+            return _run_ext_source(self._embedded_sources[name], name)
+
+        # Search the script/artifact directory first, then the project lib/
+        # and finally the working directory.
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        search_dirs = [
+        search_dirs = list(self._search_roots) + [
             os.path.join(repo_root, "lib"),
             os.getcwd(),
         ]
+        seen = set()
+        search_dirs = [d for d in search_dirs if not (d in seen or seen.add(d))]
         ext_path = name.replace(".", os.sep) + ".ext"
         for d in search_dirs:
             candidate = os.path.join(d, ext_path)
             if os.path.isfile(candidate):
                 with open(candidate, encoding="utf-8") as fh:
                     source = fh.read()
-                # Use the Python transpiler for .ext libs (they were written for it)
-                from .runtime import Runtime as _RT
-
-                rt = _RT(search_roots=[os.path.dirname(candidate)])
-                ns = rt.run(source)
-                mod_ns = {k: v for k, v in ns.items() if k not in ("__name__", "__file__")}
-                mod_obj = type("Module", (), mod_ns)()
-                mod_obj.__dict__.update(mod_ns)
-                return mod_obj
+                return _run_ext_source(source, name, os.path.dirname(candidate))
         # Fallback: try Python import
         try:
             return __import__(name)
@@ -750,15 +854,25 @@ class VM:
                     [fn.instance] + list(args),
                     kwargs=kwargs,
                     upvalues=fn.closure.upvalues,
+                    all_fns=fn.closure.all_fns,
                 )
             finally:
                 self._instance_stack.pop()
         if isinstance(fn, ExternumClosure):
             if getattr(fn.fn, "is_generator", False):
                 sink: list = []
-                self.run_function(fn.fn, list(args), kwargs=kwargs, upvalues=fn.upvalues, yield_sink=sink)
+                self.run_function(
+                    fn.fn,
+                    list(args),
+                    kwargs=kwargs,
+                    upvalues=fn.upvalues,
+                    yield_sink=sink,
+                    all_fns=fn.all_fns,
+                )
                 return iter(sink)
-            return self.run_function(fn.fn, list(args), kwargs=kwargs, upvalues=fn.upvalues)
+            return self.run_function(
+                fn.fn, list(args), kwargs=kwargs, upvalues=fn.upvalues, all_fns=fn.all_fns
+            )
         if isinstance(fn, BytecodeFunction):
             if getattr(fn, "is_generator", False):
                 sink = []
@@ -1010,8 +1124,10 @@ class VM:
                 elif op == MAKE_FN:
                     idx = _read_u16()
                     fn = all_fns[idx]
-                    closure = ExternumClosure(fn, dict(locals_), self)
+                    closure = ExternumClosure(fn, dict(locals_), self, all_fns)
                     stack.append(closure)
+                    if self._capture_closures is not None:
+                        self._capture_closures.append(closure)
                     self._fns_by_name[fn.name] = fn  # diagnostics: line lookup
 
                 elif op == MAKE_CLASS:
@@ -1334,6 +1450,18 @@ class VM:
                     if not val:
                         raise AssertionError(f"assertion failed: {val!r}")
 
+                elif op == BASH_EXEC:
+                    import subprocess
+
+                    code_idx = _read_u16()
+                    code = constants[code_idx]
+                    # Keep the child's output in source order relative to the
+                    # VM's buffered print output.
+                    try:
+                        self._stdout.flush()
+                    except Exception:
+                        pass
+                    subprocess.run(code, shell=True)
                 elif op == PANIC:
                     msg = stack.pop() if stack else "panic"
                     raise ExternumError(f"panic: {msg}")
@@ -1628,6 +1756,18 @@ class VM:
         return type(obj).__name__
 
     def _builtin_isinstance(self, obj, cls):
+        if isinstance(cls, ExternumClass):
+            if not isinstance(obj, ExternumInstance):
+                return False
+            current = object.__getattribute__(obj, "_cls")
+            seen = set()
+            while isinstance(current, ExternumClass) and id(current) not in seen:
+                if current is cls:
+                    return True
+                seen.add(id(current))
+                bases = getattr(current, "bases", [])
+                current = bases[0] if bases else None
+            return False
         type_map = {
             "int": int,
             "float": float,

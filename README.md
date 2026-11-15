@@ -122,7 +122,7 @@ Linux 7.2.4-arch1-2
 
 ```bash
 pip install externum        # PyPI
-externum --version          # Externum 4.4.0
+externum --version          # Externum 4.4.1
 
 # From source
 git clone https://github.com/BartoszOsiej/externum.git

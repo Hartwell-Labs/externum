@@ -42,6 +42,7 @@ Opcodes:
 """
 
 import ast as _pyast
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Any
@@ -105,6 +106,7 @@ CALL_EX = 0x56  # fn, args-list, kwargs-dict  (star/kwargs aware call)
 
 GET_ATTR = 0x60
 SET_ATTR = 0x61
+BASH_EXEC = 0xE9
 GET_INDEX = 0x62
 SET_INDEX = 0x63
 DEL_INDEX = 0x64
@@ -179,6 +181,8 @@ class BytecodeFunction:
     name: str
     arg_names: list[str] = field(default_factory=list)
     kw_defaults: dict[str, Any] = field(default_factory=dict)
+    vararg: str | None = None
+    kwarg: str | None = None
     bytecode: bytearray = field(default_factory=bytearray)
     constants: list[Any] = field(default_factory=list)
     inner_fns: list["BytecodeFunction"] = field(default_factory=list)
@@ -200,6 +204,9 @@ class BytecodeModule:
     enums: dict[str, dict] = field(default_factory=dict)
     traits: dict[str, dict] = field(default_factory=dict)
     imports: list[str] = field(default_factory=list)
+    # Source text for local `.ext` imports, bundled so an artifact can run
+    # without the original source tree.
+    embedded_sources: dict[str, str] = field(default_factory=dict)
     line_table: dict[int, int] = field(default_factory=dict)  # bytecode_offset -> source line
 
 
@@ -486,13 +493,15 @@ class BytecodeCompiler:
     def _stmt_FUNCTION(self, node: ASTNode):
         self._compile_function_def(node)
 
-    def _compile_function_def(self, node: ASTNode, is_async: bool = False):
+    def _compile_function_def(self, node: ASTNode, is_async: bool = False, store: bool = True):
         name = node.value
         params_node = node.children[0] if node.children and node.children[0].type == "PARAMS" else None
         body_nodes = node.children[1:] if params_node else node.children
 
         arg_names = []
         kw_defaults = {}
+        vararg = None
+        kwarg = None
         if params_node:
             # Parse defaults from the PARAMS string value (e.g. "name='world'")
             params_str = str(params_node.value) if params_node.value else ""
@@ -503,8 +512,13 @@ class BytecodeCompiler:
                         k, v = part.split("=", 1)
                         defaults[k.strip()] = self._eval_const(v.strip())
             for p in params_node.children or []:
-                pname = p.value
-                pname = pname.lstrip("*")
+                pname = str(p.value)
+                if pname.startswith("**"):
+                    kwarg = pname[2:].split(":")[0].strip()
+                    continue
+                if pname.startswith("*"):
+                    vararg = pname[1:].split(":")[0].strip()
+                    continue
                 if pname in defaults:
                     kw_defaults[pname] = defaults[pname]
                 arg_names.append(pname)
@@ -513,6 +527,8 @@ class BytecodeCompiler:
             name=name,
             arg_names=arg_names,
             kw_defaults=kw_defaults,
+            vararg=vararg,
+            kwarg=kwarg,
             is_async=is_async,
         )
         old_fn = self._current_fn
@@ -521,6 +537,10 @@ class BytecodeCompiler:
         self._scope_stack = [{}]
         for a in arg_names:
             self._declare_var(a)
+        if vararg:
+            self._declare_var(vararg)
+        if kwarg:
+            self._declare_var(kwarg)
 
         old_line = self._line
         old_saw_yield = getattr(self, "_saw_yield", False)
@@ -541,6 +561,11 @@ class BytecodeCompiler:
         fn_idx = len(self.module.functions)
         self.module.functions.append(fn)
         self._emit(MAKE_FN, fn_idx)
+        if not store:
+            # Class/impl methods are installed with SET_ATTR by the caller;
+            # leaking them as module globals would shadow locals with the
+            # same name (e.g. a local `total` next to a method `total`).
+            return
         name_idx = self._add_const(name)
         # At module level, store as global so recursive calls can find it
         if self._current_fn is None:
@@ -561,8 +586,7 @@ class BytecodeCompiler:
         attributes = []
         for child in body:
             if child.type == "FUNCTION":
-                self._compile_function_def(child)
-                methods.append(child.value)
+                methods.append(child)
             elif child.type in ("ASSIGN", "CONST") and child.value:
                 attributes.append(child)
 
@@ -598,11 +622,12 @@ class BytecodeCompiler:
                 self._emit(LOAD_CONST, self._add_const(None))
             self._emit(SET_ATTR, self._add_const(aname))
 
-        # Now set each method on the class
-        for mname in methods:
+        # Now set each method on the class. Methods are compiled with
+        # store=False so they only exist as class attributes.
+        for method in methods:
             self._compile_name(name)  # push class
-            self._compile_name(mname)  # push method fn
-            self._emit(SET_ATTR, self._add_const(mname))
+            self._compile_function_def(method, store=False)
+            self._emit(SET_ATTR, self._add_const(method.value))
 
     def _stmt_IF(self, node: ASTNode):
         if not node.children:
@@ -848,9 +873,27 @@ class BytecodeCompiler:
                 methods.append(child.value)
         self.module.traits[name] = {"methods": methods}
 
+    def _stmt_BASH_BLOCK(self, node: ASTNode):
+        code = str(node.value or "").strip()
+        self._emit(BASH_EXEC, self._add_const(code))
+
+    def _stmt_BASH_COMMAND(self, node: ASTNode):
+        cmd = " ".join(str(c.value) for c in node.children if hasattr(c, "value"))
+        self._emit(BASH_EXEC, self._add_const(cmd))
+
     def _stmt_IMPL(self, node: ASTNode):
-        # Store impl metadata — runtime handles dispatch
-        pass
+        """impl TRAIT for CLASS: define each method and attach it to CLASS."""
+        trait, _, cls = str(node.value).partition(" for ")
+        trait, cls = trait.strip(), cls.strip()
+        for child in node.children:
+            if child.type != "FUNCTION":
+                continue
+            self._compile_name(cls)
+            self._compile_function_def(child, store=False)
+            self._emit(SET_ATTR, self._add_const(child.value))
+        if trait and cls:
+            self.module.traits.setdefault(trait, {"methods": []})
+            self.module.traits[trait].setdefault("impls", []).append(cls)
 
     def _stmt_MATCH(self, node: ASTNode):
         """match expr: case pattern: body — compiled as if/elif chain."""
@@ -873,8 +916,36 @@ class BytecodeCompiler:
             skip = None
             bindings: list[str] = []
 
+            enum_pat = re.match(
+                r"^([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:\((.*)\))?$", pat, re.DOTALL
+            )
             if pat in ("_", ""):
                 pass  # wildcard: always matches
+            elif enum_pat:
+                # enum variant: `case Shape.Circle:` / `case Shape.Circle(r):`
+                _enum, variant, payload = enum_pat.groups()
+                # Match both the enum type and variant name so unrelated enums
+                # with a same-named variant do not collide.
+                self._compile_name(subject_name)
+                self._emit(GET_ATTR, self._add_const("typename"))
+                self._emit(LOAD_CONST, self._add_const(_enum))
+                self._emit(EQ)
+                self._compile_name(subject_name)
+                self._emit(GET_ATTR, self._add_const("variant"))
+                self._emit(LOAD_CONST, self._add_const(variant))
+                self._emit(EQ)
+                self._emit(AND)
+                skip = self._emit_jump(JUMP_IF_NOT)
+                args = self._split_match_args(payload or "")
+                for i, arg in enumerate(args):
+                    if arg.isidentifier() and arg not in ("True", "False", "None"):
+                        self._compile_name(subject_name)
+                        self._emit(GET_ATTR, self._add_const("data"))
+                        if len(args) > 1:
+                            self._emit(LOAD_CONST, self._add_const(i))
+                            self._emit(GET_INDEX)
+                        self._store_var(arg)
+                        bindings.append(arg)
             elif pat.isidentifier() and pat not in ("True", "False", "None"):
                 # binding pattern: `case n:` binds the subject
                 self._compile_name(subject_name)
@@ -930,6 +1001,26 @@ class BytecodeCompiler:
         for p in end_patches:
             self._patch_jump(p)
 
+    @staticmethod
+    def _split_match_args(payload: str) -> list[str]:
+        """Split enum-pattern payload on top-level commas."""
+        if not payload.strip():
+            return []
+        items, buf, depth = [], [], 0
+        for ch in payload:
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            if ch == "," and depth == 0:
+                items.append("".join(buf).strip())
+                buf = []
+            else:
+                buf.append(ch)
+        if "".join(buf).strip():
+            items.append("".join(buf).strip())
+        return items
+
     def _stmt_STRUCT(self, node: ASTNode):
         name = node.value
         fields = []
@@ -963,7 +1054,17 @@ class BytecodeCompiler:
             self._declare_var(name)
 
     def _stmt_STATIC(self, node: ASTNode):
-        self._stmt_CONST(node)  # similar semantics in bytecode
+        # `static NAME: Type = expr` — skip the TYPE node, compile the value.
+        value = next((c for c in reversed(node.children) if c.type != "TYPE"), None)
+        if value is None:
+            return
+        self._compile_expr(value)
+        idx = self._add_const(node.value)
+        if self._current_fn is None:
+            self._emit(STORE_GLOBAL, idx)
+        else:
+            self._emit(STORE_VAR, idx)
+        self._declare_var(node.value)
 
     def _stmt_DEFER(self, node: ASTNode):
         """defer: body — push deferred expressions."""
@@ -1412,6 +1513,11 @@ class BytecodeCompiler:
             # Handle dotted names like g.greet, Color.Red, o.unwrap
             if fn == "super":
                 self._compile_name("super")
+            elif fn.startswith("super()."):
+                # `super().method(...)`: resolve the base proxy first, then
+                # take the bound method off it.
+                self._emit2(INTRINSIC, builtin_map["super"], 0)
+                self._emit(GET_ATTR, self._add_const(fn.split(".", 1)[1]))
             elif "." in fn:
                 parts = fn.rsplit(".", 1)
                 self._compile_simple_expr(parts[0])  # receiver: obj, call, literal…
@@ -1714,7 +1820,7 @@ class BytecodeCompiler:
     def _expr_DOT(self, node: ASTNode):
         parts = node.value.rsplit(".", 1)
         if len(parts) == 2:
-            self._compile_name(parts[0])
+            self._compile_simple_expr(parts[0])
             idx = self._add_const(parts[1])
             self._emit(GET_ATTR, idx)
 
@@ -1897,6 +2003,29 @@ class BytecodeCompiler:
         if expr.isidentifier():
             self._compile_name(expr)
             return
+        # dotted attribute chain: self.counts, obj.inner.value
+        if "." in expr and all(part.isidentifier() for part in expr.split(".")):
+            base, *attrs = expr.split(".")
+            self._compile_name(base)
+            for attr in attrs:
+                self._emit(GET_ATTR, self._add_const(attr))
+            return
+        # subscript chain: self.counts[key], c.most_common()[0]
+        if expr.endswith("]") and "[" in expr:
+            self._expr_INDEX(ASTNode("INDEX", value=expr))
+            return
+        # super().method(args) — resolve the base proxy, then the method.
+        if expr.startswith("super().") and expr.endswith(")"):
+            rest = expr[len("super().") :]
+            if "(" in rest:
+                method_name, _, args_part = rest.partition("(")
+                args = self._parse_list_items(args_part[:-1]) if args_part[:-1].strip() else []
+                self._emit2(INTRINSIC, 58, 0)
+                self._emit(GET_ATTR, self._add_const(method_name))
+                for arg in args:
+                    self._compile_simple_expr(arg)
+                self._emit1(CALL, len(args))
+                return
         # function call: name(args) — fn pushed first, then args
         if "(" in expr and expr.endswith(")"):
             paren_idx = self._find_top_level_paren(expr)

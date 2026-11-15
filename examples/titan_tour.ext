@@ -1,0 +1,348 @@
+# titan_tour.ext — Externum 4.4.1 "Titan" feature tour
+#
+# One program that exercises the whole surface language: types, literals,
+# operators, control flow, functions, closures, generators, OOP, traits,
+# structs, enums, pattern matching, exceptions, with, defer, pointers,
+# concurrency, comprehensions, modules, stdlib and bash integration.
+#
+# Run on both backends and compare:
+#   externum run examples/titan_tour.ext --backend python
+#   externum run examples/titan_tour.ext --backend vm
+#   externum compile examples/titan_tour.ext --target bytecode -o /tmp/tour.exbc
+#   externum run /tmp/tour.exbc
+
+import jsonx
+import mathx
+import strings
+import structs
+import tour_helper
+
+# compile-time text macro
+macro SQUARE(x) {
+    (x) * (x)
+}
+
+const LIMIT = 5
+static BUILD: Str = "4.4.1"
+type Number = Int | Float
+
+
+trait Speaker:
+    def speak(self) -> Str:
+        pass
+
+
+struct Point:
+    x: Int
+    y: Int
+
+
+enum Shape:
+    Circle(Float)
+    Square(Float)
+    Blank
+
+
+class Animal:
+    def __init__(self, name: Str):
+        self.name = name
+
+    def speak(self) -> Str:
+        return "..."
+
+    def label(self) -> Str:
+        return f"Animal({self.name})"
+
+
+class Dog(Animal):
+    def __init__(self, name: Str, breed: Str = "mixed"):
+        super().__init__(name)
+        self.breed = breed
+
+    def speak(self) -> Str:
+        return "woof"
+
+    def label(self) -> Str:
+        return f"{super().label()}/{self.breed}"
+
+
+class Robot:
+    def __init__(self, serial: Int):
+        self.serial = serial
+
+    def speak(self) -> Str:
+        return f"beep-{self.serial}"
+
+
+impl Speaker for Robot:
+    def speak(self) -> Str:
+        return f"impl-beep-{self.serial}"
+
+
+# defaults, varargs and keyword args
+def greet(name: Str = "world", *args: Any, **kwargs: Any) -> Str:
+    parts: List[Str] = [name]
+    for a in args:
+        parts.append(str(a))
+    for k in kwargs:
+        parts.append(f"{k}={kwargs[k]}")
+    return "|".join(parts)
+
+
+# closure factory
+def make_adder(n: Int):
+    def adder(x: Int) -> Int:
+        return x + n
+
+    return adder
+
+
+# generator + yield from
+def fib(n: Int):
+    mut a: Int = 0
+    mut b: Int = 1
+    for _ in range(n):
+        yield a
+        t: Int = a
+        a = b
+        b = t + b
+
+
+def echo_chain():
+    yield from [10, 20, 30]
+
+
+# recursion
+def factorial(n: Int) -> Int:
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
+
+
+# defer, including a nested block form
+def deferred_demo() -> Void:
+    defer print("defer: function exit")
+    print("defer: body")
+    defer:
+        print("defer: block exit")
+
+
+# concurrency worker
+def worker(ch: Any) -> Void:
+    send(ch, 99)
+
+
+# exception paths with else/finally
+def exception_paths(kind: Int) -> Str:
+    try:
+        if kind == 1:
+            raise ValueError("boom")
+        if kind == 2:
+            raise TypeError("wrong type")
+        return "no error"
+    except ValueError as e:
+        return f"value:{e}"
+    except TypeError as e:
+        return f"type:{e}"
+    else:
+        return "else"
+    finally:
+        print("finally: cleanup")
+
+
+def double2(n: Int, m: Int) -> Int:
+    return n * m
+
+
+def render_shape(shape: Shape) -> Str:
+    match shape:
+        case Shape.Circle(r) if r > 1.0:
+            return f"big circle {r}"
+        case Shape.Circle(r):
+            return f"small circle {r}"
+        case Shape.Square(s):
+            return f"square {s}"
+        case _:
+            return "blank"
+
+
+def main() -> Void:
+    print("=== numbers & literals ===")
+    mut a: Int = 0b1010
+    mut b: Int = 0xFF
+    mut c: Int = 0o17
+    print("numbers", a, b, c, 3.5, LIMIT, BUILD)
+
+    print("\n=== operators ===")
+    print("arith", 5 + 3, 5 - 3, 5 * 3, 5 / 2, 17 // 5, 17 % 5, 2 ** 8)
+    print("bit", 6 & 3, 6 | 3, 6 ^ 3, ~6, 1 << 4, 32 >> 2)
+    print("bool", True and False, True or False, not False, True && False, True || False)
+    print("cmp", 0 < a < 20, a != b, a ≈ 10, a ≠ 11)
+    print("ternary", "big" if a > 5 else "small")
+
+    print("\n=== assignment ===")
+    mut total: Int = 0
+    total += 5
+    total *= 2
+    total -= 1
+    total //= 3
+    total **= 2
+    total %= 7
+    print("aug", total)
+    mut shifted: Int = 0
+    shifted ← 9
+    print("arrow", shifted)
+    if (n := 7) > 5:
+        print("walrus", n)
+    print("pipe", 5 |> double2(3))
+
+    print("\n=== collections ===")
+    xs: List[Int] = [1, 2, 3, 4, 5]
+    ys: List[Int] = [0, *xs, 6]
+    tup: Any = (1, 2, 3)
+    left, right = 1, 2
+    d: Dict[Str, Int] = {"a": 1, "b": 2}
+    s: Set[Int] = {1, 2, 2, 3}
+    print("list", ys)
+    print("tuple", tup[0], tup[-1], left + right)
+    print("dict", d["a"], d["b"], len(d))
+    print("set", sorted(s))
+    xs[0] = 9
+    xs[1] += 10
+    del xs[2]
+    print("mutated", xs)
+    print("slices", xs[1:4], xs[::-1])
+    print("membership", 2 in xs, 99 not in xs)
+
+    print("\n=== comprehensions ===")
+    print("listcomp", [i * i for i in range(6) if i % 2 == 0])
+    print("dictcomp", {i: i * i for i in range(3)})
+    print("setcomp", sorted({i % 3 for i in range(10)}))
+    print("nested", [(i, j) for i in range(2) for j in range(2)])
+
+    print("\n=== strings ===")
+    print("fstring", f"{a} {3.14159:.2f} {42!r}")
+    print("dollar", $"interp {a + b}")
+    print("triple", """line1
+line2""")
+    print("methods", "abc"[1], len("abc"), "a,b,c".split(","))
+
+    print("\n=== control flow ===")
+    for i in range(6):
+        if i == 2:
+            continue
+        if i == 5:
+            break
+        print("for", i)
+    mut k: Int = 0
+    while k < 3:
+        print("while", k)
+        k += 1
+    for idx, value in enumerate(["x", "y"]):
+        print("enum", idx, value)
+    mut loop_count: Int = 0
+    loop:
+        loop_count += 1
+        if loop_count == 2:
+            break
+    print("loop", loop_count)
+
+    print("\n=== match ===")
+    match 2:
+        case 1:
+            print("match one")
+        case n2 if n2 > 1:
+            print("match guard", n2)
+        case _:
+            print("match other")
+    match [4, 5]:
+        case [p, q]:
+            print("match list", p + q)
+        case _:
+            print("match list other")
+    match (6, 7):
+        case (u, v):
+            print("match tuple", u * v)
+        case _:
+            print("match tuple other")
+    print("enum match", render_shape(Shape.Circle(2.5)))
+    print("enum match", render_shape(Shape.Square(3.0)))
+    print("enum match", render_shape(Shape.Blank()))
+
+    print("\n=== functions ===")
+    print("greet", greet("Titan", 1, 2, mode="tour"))
+    add5: Any = make_adder(5)
+    print("closure", add5(10))
+    print("lambda", sorted([3, 1, 2], key=lambda n: -n))
+    print("recursion", factorial(6))
+    print("generator", [f for f in fib(8) if f % 2 == 0])
+    print("yield from", list(echo_chain()))
+
+    print("\n=== exceptions ===")
+    print(exception_paths(0))
+    print(exception_paths(1))
+    print(exception_paths(2))
+    assert 2 > 1
+    try:
+        raise RuntimeError("custom")
+    except RuntimeError as e:
+        print("raised", e)
+
+    print("\n=== with ===")
+    with open("/tmp/titan_tour.txt", "w") as fh:
+        fh.write("titan")
+    with open("/tmp/titan_tour.txt") as fh:
+        print("with", fh.read())
+
+    print("\n=== defer ===")
+    deferred_demo()
+
+    print("\n=== memory ===")
+    p: Ptr[Int] = alloc(Int)
+    @p = 42
+    print("pointer", @p)
+    free(p)
+
+    print("\n=== concurrency ===")
+    ch: Any = chan()
+    spawn(worker(ch))
+    print("channel", recv(ch))
+
+    print("\n=== compile-time ===")
+    comptime C = 2 + 3
+    print("comptime", C, SQUARE(6))
+
+    print("\n=== structs & enums ===")
+    pt: Point = Point(3, 4)
+    print("struct", pt.x, pt.y, pt)
+    shape: Shape = Shape.Circle(2.0)
+    print("enum", shape, shape.data)
+    print("enum eq", Shape.Blank == Shape.Blank())
+
+    print("\n=== traits & classes ===")
+    dog: Dog = Dog("Rex", "lab")
+    robot: Robot = Robot(7)
+    print("inherit", dog.speak(), dog.label())
+    print("trait", robot.speak())
+    print("isinstance", isinstance(dog, Animal))
+
+    print("\n=== imports & stdlib ===")
+    print("helper", tour_helper.triple(4), tour_helper.NAME, tour_helper.banner("ok"))
+    print("mathx", mathx.gcd(48, 36), mathx.factorial(5))
+    print("strings", strings.slugify("Hello World!"), strings.is_palindrome("kajak"))
+    print("json", jsonx.dump_str({"ok": True, "n": 3}))
+    stack: Any = structs.Stack()
+    stack.push(1)
+    stack.push(2)
+    print("structs", stack.size(), stack.pop())
+
+    print("\n=== bash ===")
+    `echo bash-inline`
+    %%
+    echo bash-block
+    %%
+
+    print("\n=== done ===")
+
+
+main()

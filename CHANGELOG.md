@@ -2,6 +2,57 @@
 
 All notable changes to Externum will be documented in this file.
 
+## [4.4.1] - 2026-11-15 — "Titan"
+
+Feature-tour hardening release. `examples/titan_tour.ext` exercises the whole
+language on the Python transpiler, the EXBC VM and a compiled `.exbc`
+artifact; all three now print identical output. The codename stays "Titan".
+
+### Added
+- **`examples/titan_tour.ext`** — end-to-end language tour covering literals,
+  operators, control flow, functions, closures, generators, OOP, traits,
+  structs, enums, pattern matching, exceptions, `with`, `defer`, pointers,
+  concurrency, modules, stdlib and inline/block Bash.
+- **Enum constructor patterns** — `case Shape.Circle(r)` now parses, binds the
+  payload and supports guards on both backends.
+- **Bundled `.exbc` imports** — `compile --target bytecode` embeds locally
+  resolvable `.ext` modules, so the artifact runs after being moved away from
+  the source tree.
+- **Native `.ext` imports on the VM** — imported modules are compiled to EXBC
+  and executed in an isolated namespace on the VM, not through the Python
+  transpiler; their functions keep access to module globals through closure
+  upvalues.
+- **VM `impl` dispatch** — `impl Trait for Class` now installs methods on the
+  class instead of being a no-op.
+- **VM `isinstance` for Externum classes** — inheritance chains are walked
+  instead of passing `ExternumClass` to Python's `isinstance`.
+- **Bash blocks on the VM** — inline `` `cmd` `` and `%%` blocks execute through
+  the new `BASH_EXEC` opcode.
+
+### Fixed
+- **Enum patterns dropped their payload** — the parser kept only `Shape` from
+  `Shape.Circle(r)`, producing `name 'r' is not defined` in generated Python.
+- **VM local imports** — `_vm_import` now searches the script/artifact
+  directory before `lib/` and the working directory, so sibling `.ext` modules
+  resolve; the old error line pointed at the wrong source line.
+- **Variadic parameters on the VM** — `*args` / `**kwargs` names include their
+  annotation in the AST; both are now stripped and bound correctly.
+- **`super()` on the VM** — `super().__init__(...)` resolved Python's own
+  `ExternumSuper.__init__`; dunder lookup now goes through base classes.
+- **`static` on the VM** printed the type object (`<class 'str'>`) instead of
+  the declared value; the `TYPE` child is now skipped.
+- **`.exbc` compilation skipped `preprocess`**, so macros such as `SQUARE(x)`
+  were undefined when running the artifact.
+- **Class methods leaked as module globals**, so a method named `total`
+  shadowed a local `total` inside another method; methods now exist only as
+  class attributes.
+- **Dotted and subscripted receivers** in simple expressions (`self.counts`,
+  `self.counts[k]`, `c.most_common()[0]`) were compiled as a single name.
+- **Lambdas/functions created inside imported modules** used the importer's
+  function table, causing an `IndexError`; each closure now carries its own
+  module function table.
+- 7 new regressions in `tests/test_v441_tour.py` (459 total).
+
 ## [4.4.0] - 2026-11-12 — "Titan"
 
 Language and VM parity release: the bytecode VM (the default `externum run`

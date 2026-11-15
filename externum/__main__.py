@@ -238,6 +238,56 @@ def cmd_repl(args) -> None:
         sys.exit(1)
 
 
+def _collect_ext_sources(source: str, source_dir: str, seen: dict | None = None) -> dict[str, str]:
+    """Find local `.ext` modules imported by `source` and bundle their text.
+
+    The artifact can then run after being moved away from the source tree;
+    the VM resolves embedded modules before searching the filesystem.
+    """
+    import os
+    import re
+
+    seen = seen if seen is not None else {}
+    try:
+        ast = list(Parser(Lexer(source).tokenize()).parse())
+    except Exception:
+        return seen
+
+    imports: list[str] = []
+
+    def walk(nodes):
+        for node in nodes:
+            if node.type == "IMPORT" and node.value:
+                raw = str(node.value)
+                if raw.startswith("import "):
+                    imports.extend(p.strip() for p in raw[7:].split(",") if p.strip())
+                elif raw.startswith("from "):
+                    module = raw[5:].split(" import ", 1)[0].strip()
+                    if module:
+                        imports.append(module)
+            for child in getattr(node, "children", []) or []:
+                walk([child])
+
+    walk(ast)
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    search_dirs = [source_dir, os.path.join(repo_root, "lib"), os.getcwd()]
+    for name in imports:
+        name = name.split(" as ", 1)[0].strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", name) or name in seen:
+            continue
+        ext_path = name.replace(".", os.sep) + ".ext"
+        for directory in search_dirs:
+            candidate = os.path.join(directory, ext_path)
+            if not os.path.isfile(candidate):
+                continue
+            with open(candidate, encoding="utf-8") as fh:
+                module_source = fh.read()
+            seen[name] = module_source
+            _collect_ext_sources(module_source, os.path.dirname(candidate), seen)
+            break
+    return seen
+
+
 def cmd_compile(args) -> None:
     source = _read_source(args.file)
     try:
@@ -257,11 +307,16 @@ def cmd_compile(args) -> None:
             # without lexing/parsing/compiling (and without the source).
             import os
 
+            from .analysis import preprocess
             from .bytecode import save_module
 
-            tokens = Lexer(source).tokenize()
+            processed, _ = preprocess(source)
+            tokens = Lexer(processed).tokenize()
             ast = list(Parser(tokens).parse())
             module = BytecodeCompiler(ast, module_name=args.file).compile()
+            module.embedded_sources = _collect_ext_sources(
+                source, os.path.dirname(os.path.abspath(args.file)) or os.getcwd()
+            )
             out_path = args.output or os.path.splitext(args.file)[0] + ".exbc"
             save_module(module, out_path)
             print(f"Output written to {out_path}")
@@ -326,12 +381,15 @@ def cmd_compile(args) -> None:
 
 def cmd_vm(args) -> None:
     """Run via the native EXBC virtual machine."""
+    import os
+
+    search_roots = [os.path.dirname(os.path.abspath(args.file)) or os.getcwd()]
     if args.file.endswith(".exbc"):
         # Precompiled artifact — skip lexer/parser/compiler entirely.
         from .bytecode import load_module
 
         module = load_module(args.file)
-        vm = VM(argv=list(getattr(args, "args", []) or []))
+        vm = VM(argv=list(getattr(args, "args", []) or []), search_roots=search_roots)
         vm.run_module(module)
         return
     source = _read_source(args.file)
@@ -345,7 +403,7 @@ def cmd_vm(args) -> None:
         ast = list(Parser(tokens).parse())
         compiler = BytecodeCompiler(ast, module_name=args.file)
         module = compiler.compile()
-        vm = VM(argv=getattr(args, "args", []))
+        vm = VM(argv=getattr(args, "args", []), search_roots=search_roots)
         result = vm.run_module(module)
     except SyntaxError as exc:
         from .diagnostics import format_syntax_error

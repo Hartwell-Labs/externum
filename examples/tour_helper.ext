@@ -1,0 +1,11 @@
+# tour_helper.ext — sibling module used by examples/titan_tour.ext
+
+const NAME = "tour_helper"
+
+
+def triple(n: Int) -> Int:
+    return n * 3
+
+
+def banner(label: Str) -> Str:
+    return f"[{label}]"

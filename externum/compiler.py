@@ -297,14 +297,47 @@ class Compiler:
         # Handled inline by _compile_MATCH.
         pass
 
+    @staticmethod
+    def _split_pattern_items(inner: str) -> list[str]:
+        """Split pattern arguments on top-level commas only."""
+        items, buf, depth = [], [], 0
+        for ch in inner:
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            if ch == "," and depth == 0:
+                items.append("".join(buf).strip())
+                buf = []
+            else:
+                buf.append(ch)
+        if "".join(buf).strip():
+            items.append("".join(buf).strip())
+        return items
+
     def _pattern_guard(self, pattern: str, tmp: str):
         """Compile a case pattern into (condition, [(bind, source)])."""
         pattern = pattern.strip()
         if pattern == "_":
             return "True", []
+        enum_match = re.match(r"^([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:\((.*)\))?$", pattern, re.DOTALL)
+        if enum_match:
+            enum_name, variant, payload = enum_match.groups()
+            cond = f"isinstance({tmp}, {enum_name}._Variant) and {tmp}.name == {variant!r}"
+            if payload is None or not payload.strip():
+                return cond, []
+            args = self._split_pattern_items(payload)
+            data = f"{tmp}.data"
+            binds = []
+            for i, arg in enumerate(args):
+                source = data if len(args) == 1 else f"{data}[{i}]"
+                c, b = self._pattern_guard(arg, source)
+                cond += f" and ({c})"
+                binds.extend(b)
+            return cond, binds
         if pattern.startswith("[") and pattern.endswith("]"):
             inner = pattern[1:-1]
-            items = [p.strip() for p in inner.split(",")] if inner.strip() else []
+            items = self._split_pattern_items(inner)
             cond = f"type({tmp}) is list and len({tmp}) == {len(items)}"
             binds = []
             for i, item in enumerate(items):
@@ -314,7 +347,7 @@ class Compiler:
             return cond, binds
         if pattern.startswith("(") and pattern.endswith(")"):
             inner = pattern[1:-1]
-            items = [p.strip() for p in inner.split(",")] if inner.strip() else []
+            items = self._split_pattern_items(inner)
             cond = f"type({tmp}) is tuple and len({tmp}) == {len(items)}"
             binds = []
             for i, item in enumerate(items):
