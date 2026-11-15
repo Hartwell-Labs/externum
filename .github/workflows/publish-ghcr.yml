@@ -2,6 +2,12 @@ name: publish-ghcr
 
 on:
   push:
+  workflow_dispatch:
+    inputs:
+      extra_tag:
+        description: "Additional image tag (e.g. 4.4.1)"
+        required: false
+        type: string
 
 permissions: read-all
 
@@ -32,6 +38,7 @@ jobs:
             type=ref,event=tag
             type=raw,value=latest
             type=sha
+            type=raw,value=${{ inputs.extra_tag }},enable=${{ inputs.extra_tag != '' }}
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         id: build
         with:
