@@ -1,0 +1,39 @@
+name: ghcr-diagnose
+
+on:
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Token scopes
+        env:
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          for name in PUSH_TOKEN BOT_TOKEN; do
+            token="${!name}"
+            echo "== $name =="
+            if [ -z "$token" ]; then
+              echo "missing"
+              continue
+            fi
+            curl -sSI -H "Authorization: Bearer $token" https://api.github.com/user \
+              | grep -iE '^(x-oauth-scopes|x-accepted-github-permissions|x-oauth-client-id):' || true
+          done
+
+      - name: Login with PUSH_TOKEN
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.PUSH_TOKEN }}
+
+      - name: Probe existing package
+        run: |
+          docker pull alpine:3.20
+          docker tag alpine:3.20 ghcr.io/hartwell-labs/externum-probe:existing
+          docker push ghcr.io/hartwell-labs/externum-probe:existing
